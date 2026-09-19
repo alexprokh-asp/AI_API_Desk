@@ -1,92 +1,113 @@
-# AI Workspace
+# OpenAI API Desk (AI_API_Desk)
 
-A small page for sending a prompt straight to an AI API. Think of it as a visual alternative to writing CURL commands.
+An unofficial, browser-only client for the OpenAI API. You paste your own API key, press **INIT**, pick a model that your key can actually use, and send requests to the **Responses API** (`POST https://api.openai.com/v1/responses`).
 
-- Runs entirely in your browser. No backend of our own, no accounts, no database, no telemetry.
-- Your API key stays in the page's memory and is sent only to the API provider.
-- Plain HTML, CSS and JavaScript. No install, no build step.
+- Runs entirely in your browser. No backend of ours, no accounts, no database, no telemetry.
+- Plain HTML, CSS and JavaScript. No install, no build step, no dependencies.
+- OpenAI only. It is not a multi-provider client.
 
 ## Files
 
 | File | What it does |
 | --- | --- |
-| `index.html` | The page layout: key, model, prompt, RUN, response, usage. |
-| `styles.css` | How it looks. Light and dark mode follow your system. |
-| `app.js` | What it does: checks the form, sends the request, shows the answer. |
+| `index.html` | Page layout. |
+| `styles.css` | Dark developer-tool styling. |
+| `app.js` | All behaviour: INIT, request building, API calls, Markdown rendering, result display. |
 | `README.md` | This file. |
 
-## Run it on your computer
+## How INIT works
 
-Double-click `index.html`. It opens in your browser.
+1. On load, only **API key** and **INIT** are enabled. Everything else (model, parameters, prompt, attachments, tools, RUN) is locked. This is enforced in JavaScript, not just styled: the workspace is a disabled `<fieldset>`, and `run()` also refuses to do anything until INIT has succeeded.
+2. INIT calls `GET /v1/models` with your key.
+3. If OpenAI accepts the key and returns models, the workspace unlocks and the model list is filled from that response.
+4. If anything fails (wrong key, restricted key, no models, network problem), the workspace stays locked and the reason is shown. A restricted key that may not list models cannot INIT.
+5. Editing the key afterwards locks the workspace again, so the model list always belongs to the key in the field.
+
+The model list is never hardcoded. The dropdown hides IDs that cannot be the main model of a text request (embeddings, realtime, audio, image, moderation and similar). Tick **Show every model ID the API returned** to see the unfiltered list. No model is pre-selected; you choose one.
+
+## How the key is used
+
+- It is typed into a password field and copied into one JavaScript variable at INIT.
+- It is sent only in the `Authorization` header of requests to `https://api.openai.com/v1/...`.
+- It is not stored (no localStorage, no cookies), not logged, and not placed in any request body. It disappears when you close or reload the page.
+- If OpenAI echoes part of a key in an error message, the key is replaced with `[hidden]` before display.
+
+## What it can do
+
+### Parameters (only documented ones, only when the model supports them)
+
+| Control | API field | Notes |
+| --- | --- | --- |
+| Max output tokens | `max_output_tokens` | Minimum 16. Includes reasoning tokens. Offered for every model. |
+| Reasoning effort | `reasoning.effort` | Offered only for models in the rules table in `app.js`. |
+| Temperature | `temperature` | Offered only for non-reasoning GPT-4-generation model IDs. Range 0 to 2. |
+| Top P | `top_p` | Same rule. Range 0 to 1. |
+| Instructions | `instructions` | Optional. |
+
+Nothing else is sent. There is no `top_k`: it is not a Responses API parameter.
+
+**Why a rules table?** `GET /v1/models` returns only model IDs and OpenAI publishes no machine-readable list of what each model supports. So `app.js` contains a small table, matched by model ID, built from the official docs: GPT-6 Astra (effort low to max; `temperature` and `top_p` unsupported), the GPT-5.6 family (effort none to max), GPT-5.1 (none, low, medium, high), GPT-5 Pro (high only), other GPT-5/o-series reasoning models (low, medium, high only), and GPT-4-generation models (sampling parameters). A model that matches no rule gets only max output tokens. This is deliberately conservative: it may hide something a newer model supports, but it should never send a parameter that is not documented for that model. Edit the table at the top of `app.js` to change it.
+
+### Prompt and attachments
+
+- **Images** (PNG, JPEG, WEBP, non-animated GIF) are sent inline as `input_image` data URLs. Limit set by this page: 20 MB each.
+- **Documents** are uploaded to your OpenAI Files storage (`POST /v1/files`, purpose `user_data`) and referenced as `input_file` with a `file_id`. Limit set by this page: 50 MB each, matching the file inputs guide. With **Delete uploaded documents from OpenAI after RUN** ticked (the default), each document is deleted again after RUN (`DELETE /v1/files/{id}`), and is also uploaded with a one-hour expiry as a safety net in case deletion fails. Untick it and the file stays in your account.
+- These attachments belong to the current request only. This is different from File Search below.
+
+### Tools (off by default, sent only when ticked)
+
+- **Web search**: `{ "type": "web_search" }` with optional `search_context_size`. The request also sets `include: ["web_search_call.action.sources"]`. Cited pages and consulted sources are listed under the answer as links.
+- **File Search (document collection / Vector Store)**: `{ "type": "file_search", "vector_store_ids": [...] }`. You can list your vector stores, create one, and upload documents into the selected one (`POST /v1/files` with purpose `assistants`, then `POST /v1/vector_stores/{id}/files`, then the page waits for processing). Cited file names are shown. Vector stores and their files stay in your OpenAI account until you delete them elsewhere; storage may be billed by OpenAI.
+- **Image generation**: `{ "type": "image_generation" }` with optional `model`, `size`, `quality`, `output_format`, `output_compression`, `background` and `moderation`. The image models offered are those on the documented list that your key also returned. `xhigh` and `max` quality appear only for the `gpt-image-2.5-*` models. By default `tool_choice` is set to `{ "type": "image_generation" }` so an image is produced; untick **Always generate an image** to let the model decide. The returned base64 image is shown as a picture with a download link. OpenAI may require organization verification for GPT Image models.
+
+### Response
+
+- The answer is rendered as Markdown: headings, bold, italic, strikethrough, inline code, fenced code blocks, links, bullet and numbered lists (nested), blockquotes, rules and tables. The renderer builds DOM nodes and never uses HTML strings, so model output cannot inject markup. Only `http`, `https` and `mailto` links are kept, and remote Markdown images are never loaded (they become links).
+- **Model reported by the API**: shown in the Usage area, taken from the response's `model` field.
+- **Usage**: input, cached input, output, reasoning and total tokens, exactly as the response's `usage` object reports them. Nothing is estimated. Other charges, such as per-call tool fees, are not shown.
+- **Request sent**: a collapsible copy of the JSON body (long data URLs shortened, no key), so you can check what was sent.
+- Errors are explained in plain language for 401, 403, 404, 413, 429 (quota versus rate limit), 400/422, 5xx and network failures, followed by OpenAI's own message.
+
+## Not implemented
+
+- **Remaining balance / credit**: left out on purpose. As far as the official documentation shows, there is no supported API that returns remaining credit for an ordinary API key. The documented Costs API needs a separate admin key and reports spend, not balance. The dashboard billing endpoints are undocumented and meant for OpenAI's own website, and this project will not use them.
+- Streaming, background mode, multi-turn conversations, structured outputs, function calling, MCP tools, code interpreter, computer use.
+- Image editing with masks, custom image sizes, web search domain filters or location.
+- Deleting vector stores or listing their files.
+
+## Security notes
+
+- Anyone who can run JavaScript on this page can read the key while it is loaded. Only host it where you trust the code, and use a key with a spending limit that you can revoke.
+- Browser extensions can read page contents, including the key field.
+- The page is served by whoever hosts it (for example Vercel). That host serves the files but never receives the key, as long as the code is unchanged.
+
+## Browser and CORS limitations
+
+- The page calls `api.openai.com` directly from the browser. That only works if OpenAI's servers answer the browser's cross-origin checks. **This was not verified against the live API during development** (see below). If the browser refuses, the page shows a network/CORS message and there is nothing this page can do about it. Fixing it would require a proxy, and this project deliberately has none.
+- A request waits for the complete answer. Very long reasoning runs may hit a browser or network timeout. Streaming and background mode are not implemented.
+- Images and documents are held in browser memory while a request is prepared, so very large attachments can be slow.
 
 ## Deploy to Vercel
 
-This is a static site. Vercel only hosts the four files: nothing to build, no extra files needed.
+It is a static site: nothing to build and no extra files.
 
-1. Put the four files at the top level of a GitHub repository (`index.html` must not be inside a subfolder).
-2. On vercel.com choose **Add New > Project** and import that repository.
+1. Put the four files at the top level of a GitHub repository.
+2. On vercel.com choose **Add New > Project** and import the repository.
 3. Set **Framework Preset** to **Other**. Leave Build Command, Output Directory and Install Command empty.
-4. Press **Deploy**. Vercel gives you an address like `https://your-project.vercel.app`.
-5. Open the address, enter your own API key, choose a model and press RUN.
+4. Press **Deploy**, open the address, enter your key, press INIT.
 
-Alternative without GitHub: install the Vercel command-line tool on your computer, open a terminal in this folder and run `vercel`, then `vercel --prod`. (The tool needs Node.js on your machine, but it is not part of this project.)
+Or with the Vercel command-line tool: run `vercel`, then `vercel --prod`, in this folder. If visitors see a Vercel login page, check **Settings > Deployment Protection**.
 
-If visitors see a Vercel login page instead of the app, open the project's **Settings > Deployment Protection** and check the setting.
+## Verification status
 
-Every visitor uses their own API key. The key goes from their browser straight to the API provider. It is never sent to Vercel or to anyone else.
+- Request and response structures were checked against the current official OpenAI documentation (Responses API reference, text, images and vision, file inputs, web search, file search and retrieval, image generation, reasoning and model pages, Files and Vector Stores references, Models list).
+- The page was exercised in a simulated browser and in Chromium against a **mocked** OpenAI API: locked state, failed and successful INIT, model list, parameter gating, request bodies, attachments, vector store calls, error handling, Markdown rendering, image display.
+- It was **not** run against the live OpenAI API. Live behavior depends on your account, your key's permissions, model access and OpenAI's CORS policy. Please report anything that differs.
 
-## Test your first request
+## Official documentation used
 
-1. Paste your own OpenAI API key into **API key**.
-2. Choose a model from **Model**.
-3. Type something short in **Prompt**, for example: `Say hello in one sentence.`
-4. Press **RUN**.
-
-The answer appears under **Response**, and token counts appear under **Usage**. The usage area also shows the model name the API reports, so you can confirm it matches what you chose.
-
-## Change the models or the endpoint
-
-Open `app.js`. The top of the file has two settings:
-
-- `API_URL`: where requests are sent.
-- `MODELS`: the dropdown list. Each entry has an `id` (sent to the API exactly as written) and a `label` (what you see).
-
-Edit the list, save, and reload the page (or push the change to GitHub so Vercel redeploys).
-
-## Privacy and security
-
-- The key is typed into a password field and lives only in that field.
-- It is sent only to `API_URL`, only when you press RUN.
-- It is not saved (no localStorage, no cookies) and not logged. Reloading or closing the page forgets it.
-- If the provider's error text contains your key, the key is replaced with `[hidden]` before display.
-- A key typed into any web page is exposed to that page's code and to your browser extensions. Only use this on a device and browser you trust, and use a key with a spending limit that you can revoke.
-
-## Limitations of this MVP
-
-- One provider only (the OpenAI Responses API).
-- One prompt, one answer. No conversation history: each RUN is a fresh request.
-- Answers appear all at once, not streamed word by word.
-- Response is shown as plain text (no Markdown rendering).
-- Cost is not calculated. Only token counts are shown.
-- The key is not remembered between page loads, so you paste it each time.
-- The model list is written by hand and may not match what your account can use.
-- No settings such as temperature or a system prompt.
-- The page calls the provider directly from the browser, so it only works with providers that allow that (CORS).
-
-## Troubleshooting
-
-**"Could not reach the API"**: you may be offline, an extension or network filter may be blocking the request, or the provider may be refusing requests from web pages. Press F12 and look at the Console: a message mentioning CORS means the provider is refusing the request.
-
-**Works on Vercel but not when double-clicking `index.html`** (or the reverse): some browsers restrict pages opened directly from disk. Start a tiny local server and open the address it prints:
-
-```
-python -m http.server 8000
-```
-
-Then visit `http://localhost:8000`. This only serves the files.
-
-**"The API could not find this model"**: the model id is not available to your account. Edit `MODELS` in `app.js`.
-
-## Later (not built yet)
-
-File uploads, File Search, Web Search, Code Interpreter, image generation, conversation history, multiple providers, MCP tools, Computer Use / browser automation, local AI models, detailed token and cost tracking.
+- Responses API reference: https://platform.openai.com/docs/api-reference/responses
+- Text generation: https://platform.openai.com/docs/guides/text
+- Models: https://platform.openai.com/docs/models
+- Images and vision, file inputs, web search, file search, retrieval, image generation, reasoning: under https://platform.openai.com/docs/guides/
+- Files, Vector Stores and Models list references: under https://platform.openai.com/docs/api-reference/

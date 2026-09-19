@@ -15,7 +15,8 @@
 
   <main class="layout">
 
-    <section class="panel settings-sidebar" aria-label="Settings">
+    <!-- ËÅÂÀß ÏÀÍÅËÜ (Óòèëèòû è íàñòðîéêè - 1/3) -->
+    <aside class="panel sidebar" aria-label="Settings">
 
       <div class="connect">
         <label for="api-key">API key</label>
@@ -173,18 +174,20 @@
         </div>
       </fieldset>
 
-    </section>
+    </aside>
 
-    <section class="panel workspace-main" aria-label="Workspace Main">
+    <!-- ÏÐÀÂÀß ×ÀÑÒÜ (2/3 øèðèíû) -->
+    <section class="panel chat-workspace" aria-label="Chat Workspace">
 
-      <div class="result-container">
+      <!-- 1. ÎÊÍÎ ÎÒÂÅÒÀ (Ââåðõó) -->
+      <div class="response-area">
         <div class="result-body">
-          <h2>Response</h2>
+          <h2>RESPONSE</h2>
           <div id="response" class="response is-empty" aria-live="polite">The response will appear here.</div>
         </div>
 
         <div class="usage">
-          <h2>Usage</h2>
+          <h2>USAGE</h2>
           <dl id="usage-list" class="usage-numbers"></dl>
           <p id="usage-extra" class="usage-extra"></p>
         </div>
@@ -195,13 +198,16 @@
         </details>
       </div>
 
-      <div class="prompt-container">
+      <!-- 2. ÔÎÐÌÀ ÂÂÎÄÀ È ÊÍÎÏÊÀ "RUN" (Ñíèçó) -->
+      <div class="input-area">
+
         <section class="group" aria-labelledby="h-prompt">
           <h2 id="h-prompt">Prompt</h2>
           <label for="instructions">Instructions (optional)</label>
           <textarea id="instructions" rows="2" placeholder="Standing instructions for the model"></textarea>
+          
           <label for="prompt">Prompt</label>
-          <textarea id="prompt" rows="5" placeholder="Write your request here"></textarea>
+          <textarea id="prompt" rows="4" placeholder="Write your request here"></textarea>
         </section>
 
         <section class="group" aria-labelledby="h-attach">
@@ -219,6 +225,7 @@
         </section>
 
         <button id="run" type="button" class="run">RUN</button>
+
       </div>
 
     </section>

@@ -15,8 +15,7 @@
 
   <main class="layout">
 
-    <!-- Left: what you send -->
-    <section class="panel request" aria-label="Request">
+    <section class="panel settings-sidebar" aria-label="Settings">
 
       <div class="connect">
         <label for="api-key">API key</label>
@@ -27,7 +26,6 @@
         <p id="init-status" class="status" role="status">Locked. Enter your OpenAI API key and press INIT.</p>
       </div>
 
-      <!-- Everything below stays disabled until INIT succeeds (see app.js) -->
       <fieldset id="workspace" disabled>
         <legend class="sr-only">Workspace</legend>
         <div class="stack">
@@ -64,28 +62,6 @@
               </div>
             </div>
             <p id="capability-note" class="hint"></p>
-          </section>
-
-          <section class="group" aria-labelledby="h-prompt">
-            <h2 id="h-prompt">Prompt</h2>
-            <label for="instructions">Instructions (optional)</label>
-            <textarea id="instructions" rows="2" placeholder="Standing instructions for the model"></textarea>
-            <label for="prompt">Prompt</label>
-            <textarea id="prompt" rows="7" placeholder="Write your request here"></textarea>
-          </section>
-
-          <section class="group" aria-labelledby="h-attach">
-            <h2 id="h-attach">Attach to this request</h2>
-            <p class="hint">Sent with this one request. Images go inline. Documents are uploaded to your OpenAI Files storage first.</p>
-            <div class="row">
-              <button type="button" id="add-images">Add images</button>
-              <button type="button" id="add-docs">Add documents</button>
-              <input type="file" id="image-input" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden>
-              <input type="file" id="doc-input" multiple hidden>
-            </div>
-            <ul id="attachments" class="chips"></ul>
-            <p id="attach-status" class="hint" role="status"></p>
-            <label class="check"><input type="checkbox" id="delete-uploads" checked> Delete uploaded documents from OpenAI after RUN</label>
           </section>
 
           <section class="group" aria-labelledby="h-tools">
@@ -189,35 +165,61 @@
             </div>
           </section>
 
-          <button id="run" type="button" class="run">RUN</button>
+          <p class="privacy">
+            Your API key stays in this page's memory. It is sent only to api.openai.com,
+            and it is forgotten when you close or reload the page. Editing the key locks the workspace again.
+          </p>
+
         </div>
       </fieldset>
 
-      <p class="privacy">
-        Your API key stays in this page's memory. It is sent only to api.openai.com,
-        and it is forgotten when you close or reload the page. Editing the key locks the workspace again.
-      </p>
-
     </section>
 
-    <!-- Right: what comes back -->
-    <section class="panel result" aria-label="Result">
+    <section class="panel workspace-main" aria-label="Workspace Main">
 
-      <div class="result-body">
-        <h2>Response</h2>
-        <div id="response" class="response is-empty" aria-live="polite">The response will appear here.</div>
+      <div class="result-container">
+        <div class="result-body">
+          <h2>Response</h2>
+          <div id="response" class="response is-empty" aria-live="polite">The response will appear here.</div>
+        </div>
+
+        <div class="usage">
+          <h2>Usage</h2>
+          <dl id="usage-list" class="usage-numbers"></dl>
+          <p id="usage-extra" class="usage-extra"></p>
+        </div>
+
+        <details class="request-preview">
+          <summary>Request sent</summary>
+          <pre id="request-json">Nothing sent yet.</pre>
+        </details>
       </div>
 
-      <div class="usage">
-        <h2>Usage</h2>
-        <dl id="usage-list" class="usage-numbers"></dl>
-        <p id="usage-extra" class="usage-extra"></p>
-      </div>
+      <div class="prompt-container">
+        <section class="group" aria-labelledby="h-prompt">
+          <h2 id="h-prompt">Prompt</h2>
+          <label for="instructions">Instructions (optional)</label>
+          <textarea id="instructions" rows="2" placeholder="Standing instructions for the model"></textarea>
+          <label for="prompt">Prompt</label>
+          <textarea id="prompt" rows="5" placeholder="Write your request here"></textarea>
+        </section>
 
-      <details class="request-preview">
-        <summary>Request sent</summary>
-        <pre id="request-json">Nothing sent yet.</pre>
-      </details>
+        <section class="group" aria-labelledby="h-attach">
+          <h2 id="h-attach">Attach to this request</h2>
+          <p class="hint">Sent with this one request. Images go inline. Documents are uploaded to your OpenAI Files storage first.</p>
+          <div class="row">
+            <button type="button" id="add-images">Add images</button>
+            <button type="button" id="add-docs">Add documents</button>
+            <input type="file" id="image-input" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden>
+            <input type="file" id="doc-input" multiple hidden>
+          </div>
+          <ul id="attachments" class="chips"></ul>
+          <p id="attach-status" class="hint" role="status"></p>
+          <label class="check"><input type="checkbox" id="delete-uploads" checked> Delete uploaded documents from OpenAI after RUN</label>
+        </section>
+
+        <button id="run" type="button" class="run">RUN</button>
+      </div>
 
     </section>
 

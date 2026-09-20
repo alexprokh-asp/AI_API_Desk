@@ -1,1430 +1,1340 @@
-"use strict";
+/* OpenAI API Desk — plain JavaScript, no dependencies, no build step.
+   Sections: 1 helpers · 2 markdown + highlighting · 3 model capabilities · 4 API layer
+             5 state + connection · 6 models + capability UI · 7 request builder · 8 inspector
+             9 attachments · 10 run + rendering · 11 knowledge base · 12 layout + wiring */
+(() => {
+'use strict';
 
-// OpenAI API Desk: a browser client for the OpenAI Responses API (unofficial).
-// Nothing is saved anywhere. The API key lives only in this page's memory,
-// is sent only to API_BASE, and is never logged.
-//
-// Every request structure below was checked against the official OpenAI docs
-// (API reference for Responses, Files, Vector Stores, Models; guides for file
-// inputs, images, web search, file search, image generation, reasoning).
-// The links are listed in README.md.
+/* ============================================================
+   1. Helpers
+   ============================================================ */
+const API_BASE = 'https://api.openai.com/v1';
+const RESPONSES_URL = API_BASE + '/responses';
+const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+const ALL_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+const EFFORT_LABELS = { none: 'None', minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'XHigh', max: 'Max' };
 
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+const fmtNum = (n) => (typeof n === 'number' && isFinite(n) ? n.toLocaleString('en-US') : '—');
+const fmtBytes = (n) => (n < 1024 ? n + ' B' : n < 1048576 ? (n / 1024).toFixed(1) + ' KB' : (n / 1048576).toFixed(1) + ' MB');
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const uid = () => Math.random().toString(36).slice(2, 10);
+const stamp = () => new Date().toLocaleTimeString('en-GB');
 
-/* ==================================================================
-   1. Settings and documented rules (edit here)
-   ================================================================== */
-
-const API_BASE = "https://api.openai.com/v1";
-
-const MAX_IMAGE_BYTES = 20 * 1024 * 1024;   // request limit for image data URLs in the API reference
-const MAX_FILE_BYTES  = 50 * 1024 * 1024;   // "each file must be under 50 MB" (file inputs guide)
-const POLL_INTERVAL_MS = 2000;              // vector store file processing check
-const POLL_TIMEOUT_MS  = 120000;
-
-// Image models the Responses "image_generation" tool accepts in its `model`
-// field, exactly as listed in the API reference. Only those that the API also
-// returned for your key are offered.
-const IMAGE_TOOL_MODELS = [
-  "gpt-image-1", "gpt-image-1-mini", "gpt-image-1.5",
-  "gpt-image-2", "gpt-image-2-2026-04-21",
-  "gpt-image-2.5-sunburst", "gpt-image-2.5-sunburst-2026-09-08",
-  "gpt-image-2.5-flare", "gpt-image-2.5-flare-2026-09-08",
-  "chatgpt-image-latest",
-];
-// Per the reference: xhigh and max quality exist only for the 2.5 models.
-const IMAGE_QUALITY_EXTRA = /^gpt-image-2\.5-/;
-
-// GET /v1/models returns only IDs. It does not say what a model can do, and
-// OpenAI publishes no per-model parameter table. So the choices offered for
-// reasoning effort and sampling come from this list, matched by model ID.
-// The first matching rule wins. A model that matches nothing gets no
-// reasoning or sampling controls. That is deliberate: it never sends a
-// parameter that is not documented for the model.
-const MODEL_RULES = [
-  {
-    name: "GPT-6 Astra",
-    match: id => /^gpt-6-astra/.test(id),
-    reasoning: ["low", "medium", "high", "xhigh", "max"],
-    sampling: false,
-    source: "Model page: reasoning.effort supports low, medium, high, xhigh, max. Model guide: temperature and top_p are unsupported.",
-  },
-  {
-    name: "GPT-5.6",
-    match: id => /^gpt-5\.6/.test(id),
-    reasoning: ["none", "low", "medium", "high", "xhigh", "max"],
-    sampling: false,
-    source: "Model catalog: reasoning none, low, medium, high, xhigh, max. Sampling is left off because it is not documented as supported for this family.",
-  },
-  {
-    name: "GPT-5.1",
-    match: id => /^gpt-5\.1(-\d{4}-\d{2}-\d{2})?$/.test(id),
-    reasoning: ["none", "low", "medium", "high"],
-    sampling: false,
-    source: "API reference: gpt-5.1 supports none, low, medium, high.",
-  },
-  {
-    name: "GPT-5 Pro",
-    match: id => /^gpt-5-pro/.test(id),
-    reasoning: ["high"],
-    sampling: false,
-    source: "API reference: gpt-5-pro supports only high.",
-  },
-  {
-    name: "Other reasoning model",
-    match: id => /^(gpt-5|o3|o4|o1(-\d{4}-\d{2}-\d{2})?$)/.test(id) && !/chat|deep-research/.test(id),
-    reasoning: ["low", "medium", "high"],
-    sampling: false,
-    source: "Only low, medium, high are offered here. Other levels depend on the exact model and are not assumed.",
-  },
-  {
-    name: "GPT-4 generation",
-    match: id => /^(gpt-4o|gpt-4\.1|gpt-4-turbo|gpt-4$|gpt-4-\d|chatgpt-4o|gpt-3\.5)/.test(id),
-    reasoning: null,
-    sampling: true,
-    source: "Non-reasoning model: temperature and top_p are documented request parameters; reasoning is not used.",
-  },
-];
-const DEFAULT_RULE = {
-  name: "Unrecognised model",
-  reasoning: null,
-  sampling: false,
-  source: "This model ID is not in the rules table in app.js, so only max output tokens is offered.",
-};
-
-// IDs that cannot be used as the main model of a Responses text request.
-// This only tidies the dropdown. "Show every model ID" turns the filter off.
-const NOT_A_TEXT_MODEL = /image|realtime|gpt-live|audio|tts|transcribe|whisper|embedding|moderation|dall-e|sora|davinci|babbage|instruct|search-preview|computer-use/;
-
-
-/* ==================================================================
-   2. State and page elements
-   ================================================================== */
-
-const state = {
-  apiKey: "",
-  initialized: false,
-  modelIds: [],
-  images: [],          // File objects attached directly (images)
-  docs: [],            // File objects attached directly (documents)
-  vectorStores: [],
-  vectorStoresLoaded: false,
-  busy: 0,
-};
-
-const $ = id => document.getElementById(id);
-
-const keyInput = $("api-key");
-const initButton = $("init");
-const initStatus = $("init-status");
-const workspace = $("workspace");
-const modelSelect = $("model");
-const showAllModels = $("show-all-models");
-const modelCount = $("model-count");
-const maxOutput = $("max-output");
-const reasoningSelect = $("reasoning");
-const reasoningHint = $("reasoning-hint");
-const temperatureInput = $("temperature");
-const temperatureHint = $("temperature-hint");
-const topPInput = $("top-p");
-const topPHint = $("top-p-hint");
-const capabilityNote = $("capability-note");
-const instructionsInput = $("instructions");
-const promptInput = $("prompt");
-const imageInput = $("image-input");
-const docInput = $("doc-input");
-const attachmentsList = $("attachments");
-const attachStatus = $("attach-status");
-const deleteUploads = $("delete-uploads");
-const toolWeb = $("tool-web");
-const webOpts = $("web-opts");
-const webContext = $("web-context");
-const toolFiles = $("tool-files");
-const filesOpts = $("files-opts");
-const vsSelect = $("vs-select");
-const vsName = $("vs-name");
-const vsFiles = $("vs-files");
-const vsLog = $("vs-log");
-const toolImage = $("tool-image");
-const imageOpts = $("image-opts");
-const imgModel = $("img-model");
-const imgSize = $("img-size");
-const imgQuality = $("img-quality");
-const imgFormat = $("img-format");
-const imgCompression = $("img-compression");
-const imgBackground = $("img-background");
-const imgModeration = $("img-moderation");
-const imgForce = $("img-force");
-const runButton = $("run");
-const responseBox = $("response");
-const usageList = $("usage-list");
-const usageExtra = $("usage-extra");
-const requestJson = $("request-json");
-
-function el(tag, className, text) {
-  const node = document.createElement(tag);
-  if (className) node.className = className;
-  if (text !== undefined) node.textContent = text;
-  return node;
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); return true; } catch (_) { /* fall through */ }
+  const ta = document.createElement('textarea');
+  ta.value = text; ta.setAttribute('readonly', ''); ta.className = 'sr-copy';
+  document.body.appendChild(ta); ta.select();
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch (_) { ok = false; }
+  ta.remove();
+  return ok;
+}
+async function flashCopy(btn, text) {
+  const ok = await copyText(text);
+  const old = btn.dataset.label || btn.textContent;
+  btn.dataset.label = old;
+  btn.textContent = ok ? 'Copied' : 'Copy failed';
+  setTimeout(() => { btn.textContent = old; }, 1200);
+}
+function downloadFile(name, text, type) {
+  const url = URL.createObjectURL(new Blob([text], { type: type || 'application/json' }));
+  const a = document.createElement('a');
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+/* Shorten very long base64 strings for display only. Copy/Download always use the full data. */
+function shorten(v) {
+  if (typeof v === 'string') {
+    const m = /^data:[^;,]+;base64,/.exec(v);
+    if (m && v.length > 200) return v.slice(0, m[0].length + 40) + `…[${v.length.toLocaleString('en-US')} chars]`;
+    if (v.length > 2000 && /^[A-Za-z0-9+/=\s]+$/.test(v)) return v.slice(0, 40) + `…[base64, ${v.length.toLocaleString('en-US')} chars]`;
+    return v;
+  }
+  if (Array.isArray(v)) return v.map(shorten);
+  if (v && typeof v === 'object') { const o = {}; for (const k of Object.keys(v)) o[k] = shorten(v[k]); return o; }
+  return v;
+}
+function flatten(obj, prefix = '', out = []) {
+  for (const k of Object.keys(obj || {})) {
+    const v = obj[k], key = prefix ? prefix + '.' + k : k;
+    if (v && typeof v === 'object' && !Array.isArray(v)) flatten(v, key, out);
+    else out.push([key, Array.isArray(v) ? JSON.stringify(v) : String(v)]);
+  }
+  return out;
+}
 
+/* ============================================================
+   2. Markdown renderer (HTML is escaped first — no raw HTML passes through) + code highlighting
+   ============================================================ */
+const Highlight = (() => {
+  const set = (s) => new Set(s.split(' '));
+  const js = { kw: set('const let var function return if else for while do switch case break continue new class extends import from export default async await try catch finally throw typeof instanceof in of this null undefined true false yield static super delete void'), line: ['//'], block: true, tpl: true };
+  const py = { kw: set('def class return if elif else for while in not and or is None True False import from as with try except finally raise lambda pass break continue yield async await global nonlocal assert del self'), line: ['#'], triple: true };
+  const sh = { kw: set('if then else elif fi for while do done case esac function in echo export local return exit cd ls cat grep sed awk curl git npm pip sudo'), line: ['#'], dash: true };
+  const clike = { kw: set('if else for while do switch case break continue return function func fn let var const static struct class interface enum public private protected new this true false null nil void int long char float double bool string package import use type impl trait mut match async await'), line: ['//'], block: true };
+  const sql = { kw: set('select from where and or not insert into values update set delete create table drop alter join left right inner outer on group by order having limit as distinct null is in like count sum avg min max'), line: ['--'], block: true, ci: true };
+  const css = { kw: set('important'), line: [], block: true, dash: true };
+  const yaml = { kw: set('true false null yes no'), line: ['#'], keys: true, dash: true };
+  const json = { kw: set('true false null'), line: [], keys: true };
+  const LANGS = { js, javascript: js, jsx: js, ts: js, typescript: js, tsx: js, mjs: js, py, python: py, sh, bash: sh, shell: sh, zsh: sh, curl: sh, c: clike, cpp: clike, java: clike, go: clike, rust: clike, rs: clike, cs: clike, csharp: clike, php: clike, swift: clike, kotlin: clike, sql, css, scss: css, yaml, yml: yaml, json, jsonc: json };
+  const reEsc = (s) => s.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
 
-/* ==================================================================
-   3. Talking to the API
-   ================================================================== */
+  function markup(code) {
+    const re = /(<!--[\s\S]*?(?:-->|$))|(<\/?[A-Za-z][\w:-]*)|("[^"\n]*"|'[^'\n]*')|(\/?>)/g;
+    let out = '', last = 0, m;
+    while ((m = re.exec(code))) {
+      out += esc(code.slice(last, m.index));
+      const cls = m[1] ? 'tk-c' : m[2] ? 'tk-k' : m[3] ? 'tk-s' : 'tk-k';
+      out += `<span class="${cls}">${esc(m[0])}</span>`;
+      last = re.lastIndex;
+    }
+    return out + esc(code.slice(last));
+  }
 
+  function run(code, lang) {
+    lang = (lang || '').toLowerCase();
+    if (lang === 'html' || lang === 'xml' || lang === 'svg' || lang === 'markup') return markup(code);
+    const cfg = LANGS[lang];
+    if (!cfg || code.length > 200000) return esc(code);
+    const comment = [];
+    if (cfg.block) comment.push('\\/\\*[\\s\\S]*?(?:\\*\\/|$)');
+    for (const l of cfg.line) comment.push(reEsc(l) + '[^\\n]*');
+    const str = (cfg.triple ? '"""[\\s\\S]*?(?:"""|$)|\'\'\'[\\s\\S]*?(?:\'\'\'|$)|' : '') +
+      '"(?:[^"\\\\\\n]|\\\\.)*"?|\'(?:[^\'\\\\\\n]|\\\\.)*\'?' + (cfg.tpl ? '|`(?:[^`\\\\]|\\\\.)*`?' : '');
+    const word = '[A-Za-z_$][\\w$' + (cfg.dash ? '-' : '') + ']*';
+    const re = new RegExp('(' + (comment.length ? comment.join('|') : '(?!)') + ')|(' + str + ')|(\\b0x[0-9a-fA-F]+\\b|\\b\\d[\\d_]*(?:\\.\\d+)?(?:[eE][+-]?\\d+)?\\b)|(' + word + ')', 'g');
+    let out = '', last = 0, m;
+    while ((m = re.exec(code))) {
+      out += esc(code.slice(last, m.index));
+      let cls = '';
+      if (m[1]) cls = 'tk-c';
+      else if (m[2]) cls = cfg.keys && /^\s*:/.test(code.slice(re.lastIndex, re.lastIndex + 40)) ? 'tk-key' : 'tk-s';
+      else if (m[3]) cls = 'tk-n';
+      else if (m[4] && cfg.kw.has(cfg.ci ? m[4].toLowerCase() : m[4])) cls = 'tk-k';
+      out += cls ? `<span class="${cls}">${esc(m[0])}</span>` : esc(m[0]);
+      last = re.lastIndex;
+    }
+    return out + esc(code.slice(last));
+  }
+  return run;
+})();
+
+const Md = (() => {
+  const ITEM = /^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$/;
+  const HR = /^\s{0,3}([-*_])(?:\s*\1){2,}\s*$/;
+  const FENCE = /^\s{0,3}(`{3,}|~{3,})\s*([\w+#.-]*)/;
+  const wsLen = (s) => s.replace(/\t/g, '    ').length;
+
+  function safeHref(raw) { return /^(https?:|mailto:)/i.test(raw) ? raw : null; }
+
+  function inline(src) {
+    const stash = [];
+    const hold = (html) => { stash.push(html); return '\u0001' + (stash.length - 1) + '\u0001'; };
+    // code spans first so their content is never touched by other rules
+    src = src.replace(/(`+)([\s\S]*?[^`])\1(?!`)/g, (_, __, c) => hold('<code>' + esc(c.replace(/^ (.*) $/, '$1')) + '</code>'));
+    let s = esc(src);
+    // [text](url)
+    s = s.replace(/\[([^\]]+)\]\(((?:[^()\s]|\([^()\s]*\))+)(?:\s+&quot;[^&]*&quot;)?\)/g, (m, text, url) => {
+      const raw = url.replace(/&amp;/g, '&');
+      return safeHref(raw) ? hold(`<a href="${url}" target="_blank" rel="noopener noreferrer">${text}</a>`) : m;
+    });
+    // bare URLs
+    s = s.replace(/(^|[\s(])(https?:\/\/[^\s<]+[^\s<.,;:!?)&])/g, (m, pre, url) => pre + hold(`<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`));
+    s = s.replace(/\*\*([^\s*](?:[^*]*[^\s*])?)\*\*/g, '<strong>$1</strong>');
+    s = s.replace(/(^|[^\w])__([^\s_](?:[^_]*[^\s_])?)__(?=$|[^\w])/g, '$1<strong>$2</strong>');
+    s = s.replace(/(^|[^*])\*([^\s*](?:[^*]*[^\s*])?)\*(?!\*)/g, '$1<em>$2</em>');
+    s = s.replace(/(^|[\s(])_([^\s_](?:[^_]*[^\s_])?)_(?=$|[\s).,;:!?])/g, '$1<em>$2</em>');
+    s = s.replace(/~~([^\s~](?:[^~]*[^\s~])?)~~/g, '<del>$1</del>');
+    s = s.replace(/( {2,}|\\)\n/g, '<br>').replace(/\n/g, ' ');
+    return s.replace(/\u0001(\d+)\u0001/g, (_, i) => stash[+i]);
+  }
+
+  function codeBlock(code, lang) {
+    const label = lang ? esc(lang) : 'text';
+    return `<div class="code"><div class="code-head"><span>${label}</span><button type="button" class="link" data-copy-code>Copy</button></div><pre><code>${Highlight(code, lang)}</code></pre></div>`;
+  }
+
+  function isBlockStart(line) {
+    return FENCE.test(line) || /^\s{0,3}#{1,6}\s/.test(line) || HR.test(line) || /^\s{0,3}>/.test(line) || ITEM.test(line);
+  }
+
+  function splitRow(line) {
+    let s = line.trim();
+    if (s.startsWith('|')) s = s.slice(1);
+    if (s.endsWith('|') && !s.endsWith('\\|')) s = s.slice(0, -1);
+    const cells = [];
+    let cur = '';
+    for (let i = 0; i < s.length; i++) {
+      if (s[i] === '\\' && s[i + 1] === '|') { cur += '|'; i++; }
+      else if (s[i] === '|') { cells.push(cur.trim()); cur = ''; }
+      else cur += s[i];
+    }
+    cells.push(cur.trim());
+    return cells;
+  }
+
+  function table(lines, i) {
+    const head = splitRow(lines[i]);
+    const aligns = splitRow(lines[i + 1]).map((c) => (/^:-+:$/.test(c) ? 'ta-c' : /^-+:$/.test(c) ? 'ta-r' : ''));
+    let j = i + 2;
+    const rows = [];
+    while (j < lines.length && lines[j].trim() && lines[j].includes('|')) { rows.push(splitRow(lines[j])); j++; }
+    const cell = (tag, c, k) => `<${tag}${aligns[k] ? ` class="${aligns[k]}"` : ''}>${inline(c)}</${tag}>`;
+    const html = '<div class="table-wrap"><table><thead><tr>' + head.map((c, k) => cell('th', c, k)).join('') + '</tr></thead><tbody>' +
+      rows.map((r) => '<tr>' + head.map((_, k) => cell('td', r[k] || '', k)).join('') + '</tr>').join('') + '</tbody></table></div>';
+    return { html, next: j };
+  }
+
+  function list(lines, start) {
+    const first = ITEM.exec(lines[start]);
+    const base = wsLen(first[1]);
+    const ordered = /^\d/.test(first[2]);
+    const startNum = ordered ? parseInt(first[2], 10) : 1;
+    const items = [];
+    let loose = false, i = start;
+    while (i < lines.length) {
+      const m = ITEM.exec(lines[i]);
+      if (!m || HR.test(lines[i])) break;
+      const ind = wsLen(m[1]);
+      if (ind < base || (ind === base && /^\d/.test(m[2]) !== ordered)) break;
+      const contentIndent = ind + m[2].length + 1;
+      const body = [m[3]];
+      let hasBlank = false;
+      i++;
+      while (i < lines.length) {
+        const ln = lines[i].replace(/\t/g, '    ');
+        if (!ln.trim()) {
+          let j = i + 1;
+          while (j < lines.length && !lines[j].trim()) j++;
+          if (j < lines.length) {
+            const nl = lines[j].replace(/\t/g, '    ');
+            const nInd = wsLen(/^\s*/.exec(nl)[0]);
+            if (nInd > ind) { for (let k = i; k < j; k++) body.push(''); hasBlank = true; i = j; continue; }
+          }
+          break;
+        }
+        const lInd = wsLen(/^\s*/.exec(ln)[0]);
+        const lm = ITEM.exec(ln);
+        if (lm && lInd <= ind) break;
+        if (lInd > ind) { body.push(ln.replace(new RegExp('^ {0,' + Math.min(lInd, contentIndent) + '}'), '')); i++; continue; }
+        if (body[body.length - 1] !== '' && !isBlockStart(ln)) { body.push(ln.trim()); i++; continue; }
+        break;
+      }
+      items.push({ body, hasBlank });
+      let j = i;
+      while (j < lines.length && !lines[j].trim()) j++;
+      if (j > i && j < lines.length) {
+        const nm = ITEM.exec(lines[j]);
+        if (nm && !HR.test(lines[j]) && wsLen(nm[1]) === base && /^\d/.test(nm[2]) === ordered) { loose = true; i = j; }
+      }
+    }
+    const tag = ordered ? 'ol' : 'ul';
+    const attr = ordered && startNum !== 1 ? ` start="${startNum}"` : '';
+    const html = `<${tag}${attr}>` + items.map((it) => {
+      let inner = blocks(it.body);
+      if (!loose && !it.hasBlank) inner = inner.replace(/^<p>([\s\S]*?)<\/p>/, '$1');
+      return '<li>' + inner + '</li>';
+    }).join('') + `</${tag}>`;
+    return { html, next: i };
+  }
+
+  function blocks(lines) {
+    const out = [];
+    let i = 0;
+    while (i < lines.length) {
+      const line = lines[i];
+      if (!line.trim()) { i++; continue; }
+      let m = FENCE.exec(line);
+      if (m) {
+        const ch = m[1][0], len = m[1].length, lang = m[2], buf = [];
+        const close = new RegExp('^\\s{0,3}' + (ch === '`' ? '`' : '~') + '{' + len + ',}\\s*$');
+        i++;
+        while (i < lines.length && !close.test(lines[i])) { buf.push(lines[i]); i++; }
+        i++;
+        out.push(codeBlock(buf.join('\n'), lang));
+        continue;
+      }
+      m = /^\s{0,3}(#{1,6})\s+(.*?)(?:\s+#+)?\s*$/.exec(line);
+      if (m) { out.push(`<h${m[1].length}>${inline(m[2])}</h${m[1].length}>`); i++; continue; }
+      if (HR.test(line)) { out.push('<hr>'); i++; continue; }
+      if (/^\s{0,3}>/.test(line)) {
+        const buf = [];
+        while (i < lines.length && /^\s{0,3}>/.test(lines[i])) { buf.push(lines[i].replace(/^\s{0,3}>\s?/, '')); i++; }
+        out.push('<blockquote>' + blocks(buf) + '</blockquote>');
+        continue;
+      }
+      if (line.includes('|') && i + 1 < lines.length && /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(lines[i + 1]) && lines[i + 1].includes('-')) {
+        const t = table(lines, i);
+        out.push(t.html); i = t.next; continue;
+      }
+      if (ITEM.test(line)) { const r = list(lines, i); out.push(r.html); i = r.next; continue; }
+      const buf = [line];
+      i++;
+      while (i < lines.length && lines[i].trim() && !isBlockStart(lines[i])) { buf.push(lines[i]); i++; }
+      out.push('<p>' + inline(buf.join('\n')) + '</p>');
+    }
+    return out.join('');
+  }
+
+  return { render: (src) => blocks(String(src).replace(/\r\n?/g, '\n').split('\n')) };
+})();
+
+/* ============================================================
+   3. Model capabilities
+   OpenAI's /v1/models returns only id, created and owned_by — no capability data.
+   The rules below are inferred from the model name and the published model docs.
+   They only decide which controls are enabled; "Ignore inferred limits" bypasses them.
+   ============================================================ */
+function getCaps(rawId) {
+  const id = String(rawId).toLowerCase();
+  const none = { web: false, files: false, code: false, image: false };
+  const all = { web: true, files: true, code: true, image: true };
+  const caps = { family: 'unknown', known: false, reasoning: false, efforts: [], modePro: false, sampling: true, vision: null, tools: { ...none }, maxOutput: null };
+  let m;
+
+  if ((m = /^gpt-5(?:\.(\d+))?(?=$|-)/.exec(id))) {
+    const minor = m[1] ? +m[1] : 0;
+    const pro = /-pro(?=$|-)/.test(id);
+    Object.assign(caps, { family: minor ? 'gpt-5.' + minor : 'gpt-5', known: true, reasoning: true, vision: true, tools: { ...all } });
+    if (minor === 0) {
+      caps.efforts = ['minimal', 'low', 'medium', 'high'];
+      if (/codex/.test(id)) caps.efforts = ['low', 'medium', 'high'];
+      if (pro) caps.efforts = ['high'];
+    } else if (minor === 1) {
+      caps.efforts = ['none', 'low', 'medium', 'high'];
+      if (/codex-max/.test(id)) caps.efforts.push('xhigh');
+    } else if (minor <= 5) {
+      caps.efforts = ['none', 'low', 'medium', 'high', 'xhigh'];
+    } else {
+      caps.efforts = ['none', 'low', 'medium', 'high', 'xhigh', 'max'];
+      caps.modePro = true;
+    }
+    if (pro && minor >= 2) caps.efforts = caps.efforts.filter((e) => e !== 'none' && e !== 'low');
+    caps.sampling = minor >= 1 && minor <= 5 && !pro ? 'effort-none' : false;
+    if (/nano/.test(id)) caps.tools.image = false;
+  } else if (/^gpt-6/.test(id)) {
+    Object.assign(caps, { family: 'gpt-6', known: true, reasoning: true, efforts: ['low', 'medium', 'high', 'xhigh', 'max'], sampling: false, vision: true, tools: { ...all }, maxOutput: /astra/.test(id) ? 128000 : null });
+  } else if (/^o\d/.test(id)) {
+    const legacy = /^o1-(mini|preview)/.test(id);
+    Object.assign(caps, { family: 'o-series', known: true, reasoning: !legacy, efforts: legacy ? [] : ['low', 'medium', 'high'], sampling: false, vision: !/^o1-(mini|preview)|^o3-mini/.test(id), tools: /^o1|^o3-mini/.test(id) ? { ...none } : { ...all } });
+  } else if (/^(gpt-4o|chatgpt-4o|gpt-4\.1|gpt-4\.5)/.test(id)) {
+    Object.assign(caps, { family: 'gpt-4o/4.1', known: true, sampling: true, vision: true, tools: { ...all } });
+    if (/^chatgpt-4o/.test(id) || /audio|realtime|search-preview|transcribe|tts/.test(id)) caps.tools = { ...none };
+    if (/4\.1-nano/.test(id)) { caps.tools.web = false; caps.tools.image = false; }
+  } else if (/^gpt-4-turbo/.test(id)) {
+    Object.assign(caps, { family: 'gpt-4-turbo', known: true, vision: !/preview/.test(id) });
+  } else if (/^gpt-4($|-)/.test(id)) {
+    Object.assign(caps, { family: 'gpt-4', known: true, vision: /vision/.test(id) });
+  } else if (/^gpt-3\.5/.test(id)) {
+    Object.assign(caps, { family: 'gpt-3.5', known: true, vision: false });
+  }
+  return caps;
+}
+
+function describeCaps(c, override) {
+  if (override) return 'Inferred limits are ignored: every control is enabled and sent as configured. The API decides what is valid.';
+  if (!c.known) return 'Unknown model family. Reasoning and hosted tools are disabled because their support cannot be inferred. Use "Ignore inferred limits" to send them anyway.';
+  const bits = [];
+  bits.push(c.reasoning ? `reasoning: ${c.efforts.map((e) => EFFORT_LABELS[e]).join(', ')}` : 'reasoning: not supported');
+  bits.push(c.sampling === true ? 'temperature / top_p: supported' : c.sampling === 'effort-none' ? 'temperature / top_p: only with reasoning None' : 'temperature / top_p: not supported');
+  bits.push(c.vision === true ? 'image input: yes' : c.vision === false ? 'image input: no' : 'image input: unknown');
+  const tools = Object.entries({ 'web search': c.tools.web, 'file search': c.tools.files, 'code interpreter': c.tools.code, 'image generation': c.tools.image }).filter(([, v]) => v).map(([k]) => k);
+  bits.push('tools: ' + (tools.length ? tools.join(', ') : 'none'));
+  return 'Inferred from the model name (the model list carries no capability data). ' + bits.join(' · ') + '.';
+}
+
+const isTextModel = (id) => /^(gpt-|o\d|chatgpt-|codex-)/.test(id) &&
+  !/(embedding|whisper|tts|dall-e|gpt-image|moderation|realtime|audio|transcribe|diarize|sora|davinci|babbage|computer-use|-live)/.test(id);
+
+/* ============================================================
+   4. API layer
+   ============================================================ */
 class ApiError extends Error {
-  constructor(kind, status, providerMessage, code) {
-    super(kind);
-    this.kind = kind;                        // "network" or "http"
-    this.status = status || 0;
-    this.providerMessage = providerMessage || "";
-    this.code = code || "";
-  }
+  constructor(o) { super(o.message); Object.assign(this, o); }
 }
 
-// A problem with what the user typed. Shown as-is.
-class UserInputError extends Error {}
-
-// Providers sometimes echo part of a key in error text. Remove it before display.
-function hideKey(text, key) {
-  return key ? String(text).split(key).join("[hidden]") : String(text);
+function hintFor(e) {
+  if (e.kind === 'network') return 'The browser could not complete the request to api.openai.com. Check your connection, VPN or firewall, and extensions that block requests. Browsers report CORS failures the same way.';
+  if (e.kind === 'local') return '';
+  const s = e.status, code = e.code || '';
+  if (s === 401) return 'The API key was rejected. Check that it is complete, active, and belongs to the right project.';
+  if (s === 403) return code === 'unsupported_country_region_territory' ? 'OpenAI does not serve requests from this region.' : 'The key or project does not have access. Common causes: model permissions, organization verification, or region.';
+  if (s === 404) return code === 'model_not_found' ? 'This model is not available to your project. Pick another model or check project permissions.' : 'The requested resource was not found.';
+  if (s === 400 || s === 422) return e.param || /unsupported/i.test(code) ? `The parameter "${e.param || 'unknown'}" is not accepted here. Turn it off in the panel — or keep it to reproduce the error.` : 'The request is invalid. Compare the Request tab with the API reference.';
+  if (s === 413) return 'The request is too large. Reduce the attachment size or the prompt.';
+  if (s === 429) return code === 'insufficient_quota' ? 'The account has no remaining quota. Check billing and usage limits.' : 'Rate limit reached. Wait and retry, or lower the request size.';
+  if (s >= 500) return 'OpenAI-side error. Retry in a moment; quote the request ID if you contact support.';
+  return '';
 }
 
-// One place that talks to OpenAI. The key goes only into this Authorization header.
-async function callApi(method, path, options = {}) {
-  const key = state.apiKey;
-  const headers = { "Authorization": "Bearer " + key };
+function toApiError(res, text, data) {
+  const err = data && data.error && typeof data.error === 'object' ? data.error : null;
+  const message = (err && err.message) || (text ? text.slice(0, 600) : `${res.status} ${res.statusText}`);
+  return new ApiError({
+    kind: 'http', status: res.status, statusText: res.statusText, message,
+    type: err && err.type, code: err && err.code, param: err && err.param,
+    requestId: res.headers.get('x-request-id') || (message.match(/req_[A-Za-z0-9]+/) || [])[0] || null,
+    raw: text,
+  });
+}
+
+function networkError(e) {
+  return new ApiError({ kind: 'network', message: `Network error: ${e && e.message ? e.message : e}` });
+}
+
+/* Every call goes through here. The key is added to the real request only — never to anything displayed. */
+async function api(method, path, { json, form, signal } = {}) {
+  const headers = { Authorization: 'Bearer ' + state.key };
   let body;
-  if (options.json !== undefined) {
-    headers["Content-Type"] = "application/json";
-    body = JSON.stringify(options.json);
-  } else if (options.form) {
-    body = options.form;                     // the browser adds the multipart boundary
-  }
-
-  let reply;
-  try {
-    reply = await fetch(API_BASE + path, { method, headers, body });
-  } catch (error) {
-    throw new ApiError("network");
-  }
-
-  const text = await reply.text().catch(() => "");
+  if (json !== undefined) { headers['Content-Type'] = 'application/json'; body = JSON.stringify(json); }
+  else if (form) body = form;
+  let res;
+  try { res = await fetch(API_BASE + path, { method, headers, body, signal }); }
+  catch (e) { if (e && e.name === 'AbortError') throw e; throw networkError(e); }
+  const text = await res.text();
   let data = null;
-  try { data = text ? JSON.parse(text) : null; } catch (error) { data = null; }
-
-  if (!reply.ok) {
-    const info = data && data.error ? data.error : {};
-    throw new ApiError("http", reply.status, hideKey(info.message || "", key), info.code || info.type || "");
-  }
-  return data;
+  try { data = JSON.parse(text); } catch (_) { /* non-JSON body */ }
+  if (!res.ok) throw toApiError(res, text, data);
+  return { res, text, data };
 }
 
-function explainError(error) {
-  if (error instanceof UserInputError) return error.message;
-  if (!(error instanceof ApiError)) {
-    return "Unexpected error in this page: " + hideKey(error && error.message ? error.message : error, state.apiKey);
-  }
-  if (error.kind === "network") {
-    return "Could not reach api.openai.com. Check your internet connection and any extension or " +
-           "network filter that might block it. If the browser console (F12) mentions CORS, " +
-           "the browser is refusing the request and this page cannot work around that.";
-  }
+/* ============================================================
+   5. State + connection
+   ============================================================ */
+const state = {
+  key: '', ready: false, models: [], caps: null,
+  attachments: [], uploaded: [],               // uploaded = documents sent to the Files API this session
+  turns: [], selected: null, busy: false, abort: null,
+  inspectorMode: 'preview', showProblems: false,
+  lastRequest: null, lastError: null,
+  vectorStores: [], vsFiles: [],
+};
 
-  const s = error.status;
-  let message;
-  if (s === 401) {
-    message = "OpenAI rejected the API key. It may be mistyped, revoked, or belong to another organization or project.";
-  } else if (s === 403) {
-    message = "This key is not allowed to do that. It may be a restricted key without the needed permission, " +
-              "the feature may need organization verification, or OpenAI may not serve your region.";
-  } else if (s === 404) {
-    message = "OpenAI could not find that model or resource, or this key has no access to it.";
-  } else if (s === 413) {
-    message = "The request is too large. Use smaller files or images.";
-  } else if (s === 429) {
-    message = error.code === "insufficient_quota"
-      ? "This key's project has no remaining quota or credit. Check billing with OpenAI."
-      : "Rate limit reached. Wait a moment and try again.";
-  } else if (s === 400 || s === 422) {
-    message = "OpenAI did not accept the request. Usually the selected model does not support one of the options, or a value is out of range.";
-  } else if (s >= 500) {
-    message = "OpenAI reported a server error. Try again in a moment.";
-  } else {
-    message = "The request failed (HTTP " + s + ").";
-  }
-  message += " (HTTP " + s + ")";
-  if (error.providerMessage) message += "\n\nMessage from OpenAI:\n" + error.providerMessage;
-  return message;
-}
+function setStatus(el, kind, text) { el.className = 'status ' + kind; el.textContent = text; }
 
-
-/* ==================================================================
-   4. INIT: the gate for the whole workspace
-   ================================================================== */
-
-function setBusy(isBusy) {
-  state.busy += isBusy ? 1 : -1;
-  const busy = state.busy > 0;
-  keyInput.disabled = busy;
-  initButton.disabled = busy;
-}
-
-function setInitStatus(message, kind) {
-  initStatus.textContent = message;
-  initStatus.className = "status" + (kind ? " is-" + kind : "");
-}
-
-// Back to the locked state. Used at load, after a failed INIT, and when the key is edited.
-function lockWorkspace(message, kind) {
-  state.initialized = false;
-  state.apiKey = "";
-  state.modelIds = [];
-  state.vectorStores = [];
-  state.vectorStoresLoaded = false;
-  workspace.disabled = true;
-  document.body.dataset.state = "locked";
-  modelSelect.replaceChildren();
-  vsSelect.replaceChildren();
-  imgModel.replaceChildren();
-  modelCount.textContent = "";
-  applyModelRules();
-  setInitStatus(message, kind);
+function setLocked(locked) {
+  $('workspace').disabled = locked;
+  for (const id of ['prompt', 'add-images', 'add-docs']) $(id).disabled = locked;
+  refreshRunButton();
+  refreshUploadButton();
 }
 
 async function init() {
-  const key = keyInput.value.trim();
-  if (!key) {
-    lockWorkspace("Locked. Enter your OpenAI API key first.", "error");
-    return;
-  }
-
-  lockWorkspace("Checking the key with OpenAI...");
-  state.apiKey = key;
-  setBusy(true);
+  const key = $('api-key').value.trim();
+  const status = $('init-status');
+  if (!key) { setStatus(status, 'err', 'Enter an API key.'); return; }
+  if (!/^[\x21-\x7e]+$/.test(key)) { setStatus(status, 'err', 'The key contains spaces or non-ASCII characters. Re-paste it.'); return; }
+  state.key = key;
+  $('init').disabled = true;
+  setStatus(status, 'busy', 'Connecting…');
   try {
-    // A key is valid for INIT only if OpenAI accepts it and returns the model list.
-    const data = await callApi("GET", "/models");
-    if (!data || !Array.isArray(data.data) || data.data.length === 0) {
-      throw new UserInputError("OpenAI accepted the key but returned no models, so there is nothing to select.");
-    }
-    state.modelIds = data.data.map(model => model.id).filter(id => typeof id === "string").sort();
-    fillModelSelect();
-    fillImageModelSelect();
-    fillImageQuality();
-    state.initialized = true;               // the gate: run() and the key-edit lock both check this
-    workspace.disabled = false;
-    document.body.dataset.state = "ready";
-    setInitStatus("Ready. " + state.modelIds.length + " models available to this key.", "ready");
-  } catch (error) {
-    let message = explainError(error);
-    if (error instanceof ApiError && error.status === 403) {
-      message = "The key was not allowed to list models. INIT needs that. " +
-                "If it is a restricted key, give it permission to read models.\n\n" + message;
-    }
-    lockWorkspace("Locked. " + message, "error");
+    const { data } = await api('GET', '/models');
+    state.models = (data.data || []).map((m) => ({ id: m.id, created: m.created || 0, owned_by: m.owned_by }))
+      .sort((a, b) => b.created - a.created || a.id.localeCompare(b.id));
+    state.ready = true;
+    setLocked(false);
+    renderModels();
+    populateImageModels();
+    setStatus(status, 'ok', `Connected · ${state.models.length} models loaded from /v1/models`);
+    $('init').textContent = 'Re-init';
+    applyCaps();
+    if (window.matchMedia('(max-width: 900px)').matches) closePanel();
+    loadVectorStores();
+  } catch (e) {
+    state.ready = false; state.key = '';
+    setLocked(true);
+    const ex = e instanceof ApiError ? e : networkError(e);
+    setStatus(status, 'err', `INIT failed — ${errorLine(ex)}`);
+    reportError('INIT', ex);
   } finally {
-    setBusy(false);
+    $('init').disabled = false;
   }
 }
 
-
-/* ==================================================================
-   5. Models and what each model supports
-   ================================================================== */
-
-function usableModelIds() {
-  return showAllModels.checked
-    ? state.modelIds
-    : state.modelIds.filter(id => !NOT_A_TEXT_MODEL.test(id));
+function errorLine(e) {
+  if (e.kind === 'network') return e.message;
+  return `HTTP ${e.status}${e.code ? ' · ' + e.code : ''}: ${e.message}`;
 }
 
-// Fills the dropdown from the API's list. The user must choose; nothing is pre-selected.
-function fillModelSelect() {
-  const previous = modelSelect.value;
-  const ids = usableModelIds();
-  modelSelect.replaceChildren();
+/* ============================================================
+   6. Models + capability-driven UI
+   ============================================================ */
+function renderModels() {
+  const q = $('model-search').value.trim().toLowerCase();
+  const showAll = $('show-all-models').checked;
+  const sel = $('model');
+  const current = sel.value;
+  const list = state.models.filter((m) => (showAll || isTextModel(m.id)) && (!q || m.id.toLowerCase().includes(q)));
+  sel.innerHTML = '<option value="">— choose a model —</option>';
+  const ids = new Set();
+  for (const m of list) { sel.add(new Option(m.id, m.id)); ids.add(m.id); }
+  if (current && !ids.has(current)) sel.add(new Option(current, current), 1); // never drop the user's selection because of a filter
+  sel.value = current || '';
+  $('model-count').textContent = `${list.length} shown · ${state.models.length} total`;
+}
 
-  const placeholder = el("option", "", "Select a model");
-  placeholder.value = "";
-  modelSelect.append(placeholder);
-  for (const id of ids) {
-    const option = el("option", "", id);
-    option.value = id;
-    modelSelect.append(option);
+function populateImageModels() {
+  $('img-model-list').innerHTML = state.models.filter((m) => /image/.test(m.id) && /gpt-image|chatgpt-image/.test(m.id)).map((m) => `<option value="${esc(m.id)}">`).join('');
+}
+
+function setOptions(select, pairs, keep) {
+  const cur = keep ? select.value : '';
+  select.innerHTML = '';
+  for (const [v, t] of pairs) select.add(new Option(t, v));
+  select.value = pairs.some(([v]) => v === cur) ? cur : '';
+}
+
+function samplingState(c, effort, override) {
+  if (override) return { ok: true };
+  if (!c) return { ok: false, why: 'Choose a model first.' };
+  if (c.sampling === true) return { ok: true };
+  if (c.sampling === 'effort-none') return effort === 'none' ? { ok: true } : { ok: false, why: 'this model only accepts it when reasoning effort is None.' };
+  return { ok: false, why: 'this model does not support it (reasoning models reject custom sampling values).' };
+}
+
+function applyCaps() {
+  const id = $('model').value;
+  const override = $('cap-override').checked;
+  const c = id ? getCaps(id) : null;
+  state.caps = c;
+  const has = !!id;
+
+  // reasoning
+  const efforts = !has ? [] : override ? ALL_EFFORTS : c.efforts;
+  const rOK = has && (override || c.reasoning);
+  setOptions($('reasoning'), [['', 'Default (not sent)'], ...efforts.map((e) => [e, EFFORT_LABELS[e]])], true);
+  $('reasoning').disabled = !rOK;
+  $('reasoning-summary').disabled = !rOK;
+  $('reasoning-mode-wrap').hidden = !(has && (override || (c && c.modePro)));
+  $('reasoning-mode').disabled = !rOK;
+  $('reasoning-hint').textContent = !has ? 'Choose a model first.'
+    : !rOK ? 'This model does not accept reasoning settings, so none are sent.'
+    : override ? 'All documented effort values are listed. Unsupported ones will be rejected by the API.'
+    : `Values this model accepts: ${efforts.map((e) => EFFORT_LABELS[e]).join(', ')}. "Default" sends nothing and lets the model choose.`;
+
+  // sampling
+  const s = samplingState(c, $('reasoning').value, override);
+  for (const base of ['temperature', 'top-p']) {
+    $(base).disabled = !s.ok; $(base + '-num').disabled = !s.ok; $(base + '-clear').disabled = !s.ok;
   }
-  if (ids.includes(previous)) modelSelect.value = previous;
+  updateSamplingHints(s);
 
-  modelCount.textContent = ids.length + " of " + state.modelIds.length + " model IDs shown.";
-  applyModelRules();
+  // max output
+  const maxOut = c && c.maxOutput ? ` Model maximum: ${fmtNum(c.maxOutput)}.` : '';
+  const room = rOK && !override ? ' Reasoning tokens count against this limit; OpenAI suggests leaving generous room (25,000+) when experimenting.' : '';
+  $('max-output-hint').textContent = 'Maximum number of tokens the model may generate. Empty means not sent.' + maxOut + room;
+
+  // tools
+  for (const [key, cid] of [['web', 'tool-web'], ['files', 'tool-files'], ['code', 'tool-code'], ['image', 'tool-image']]) {
+    const ok = has && (override || c.tools[key]);
+    const box = $(cid);
+    box.disabled = !ok;
+    if (!ok) box.checked = false;
+    const why = document.querySelector(`[data-why="${key}"]`);
+    why.hidden = ok || !has;
+    why.textContent = 'Not available for this model (inferred from its name).';
+  }
+  syncToolPanels();
+  $('capability-note').textContent = has ? describeCaps(c, override) : 'Choose a model to see which options it accepts.';
+  if (!state.turns.some((t) => t.response)) updateStats();
 }
 
-function ruleFor(modelId) {
-  return MODEL_RULES.find(rule => rule.match(modelId)) || DEFAULT_RULE;
+function updateSamplingHints(s) {
+  s = s || samplingState(state.caps, $('reasoning').value, $('cap-override').checked);
+  const t = $('temperature-num').value, p = $('top-p-num').value;
+  $('temperature-hint').textContent = s.ok
+    ? 'Higher values generally make output more random; lower values make it more focused.' + (t === '' ? ' Currently not sent.' : '')
+    : 'Unavailable: ' + s.why;
+  $('top-p-hint').textContent = s.ok
+    ? 'Nucleus sampling. Controls the probability mass considered during token selection.' + (p === '' ? ' Currently not sent.' : '')
+    : 'Unavailable: ' + s.why;
 }
 
-function setParamHint(hintEl, message) {
-  hintEl.textContent = message;
+function syncToolPanels() {
+  $('web-opts').hidden = !$('tool-web').checked;
+  $('files-opts').hidden = !$('tool-files').checked;
+  $('image-opts').hidden = !$('tool-image').checked;
+  const fmt = $('img-format').value;
+  const comp = $('img-compression');
+  comp.disabled = !(fmt === 'jpeg' || fmt === 'webp');
+  if (comp.disabled) comp.value = '';
 }
 
-// Enables only the controls documented for the selected model.
-function applyModelRules() {
-  const id = modelSelect.value;
-  const rule = id ? ruleFor(id) : null;
+function bindSlider(base) {
+  const range = $(base), num = $(base + '-num');
+  range.addEventListener('input', () => { num.value = range.value; updateSamplingHints(); });
+  num.addEventListener('input', () => { if (num.value !== '' && !isNaN(+num.value)) range.value = num.value; updateSamplingHints(); });
+  $(base + '-clear').addEventListener('click', () => { num.value = ''; updateSamplingHints(); onControlChange(); });
+}
 
-  reasoningSelect.replaceChildren();
-  const def = el("option", "", "Default (not sent)");
-  def.value = "";
-  reasoningSelect.append(def);
+/* ============================================================
+   7. Request builder — the single source of truth for what is sent
+   ============================================================ */
+function numOrNull(v) { if (v === '' || v == null) return null; const n = Number(v); return isFinite(n) ? n : NaN; }
 
-  if (!rule) {
-    reasoningSelect.disabled = true;
-    temperatureInput.disabled = true;
-    topPInput.disabled = true;
-    temperatureInput.value = "";
-    topPInput.value = "";
-    setParamHint(reasoningHint, "Select a model first.");
-    setParamHint(temperatureHint, "Select a model first.");
-    setParamHint(topPHint, "Select a model first.");
-    capabilityNote.textContent = "";
+function buildRequest() {
+  const problems = [], warnings = [];
+  const override = $('cap-override').checked;
+  const c = state.caps;
+  const model = $('model').value;
+  const body = { model };
+  if (!model) problems.push('Choose a model.');
+
+  const instructions = $('instructions').value.trim();
+  if (instructions) body.instructions = instructions;
+
+  // input
+  const text = $('prompt').value.trim();
+  const parts = [];
+  if (text) parts.push({ type: 'input_text', text });
+  const images = state.attachments.filter((a) => a.kind === 'image');
+  for (const a of state.attachments) {
+    if (a.kind === 'image') parts.push({ type: 'input_image', image_url: a.dataUrl });
+    else if (a.status === 'ready') parts.push({ type: 'input_file', file_id: a.fileId });
+  }
+  if (!parts.length) problems.push('Enter a prompt or attach a file.');
+  body.input = parts.length === 1 && parts[0].type === 'input_text' ? text : [{ role: 'user', content: parts }];
+  if (images.length && c && c.vision === false && !override) {
+    problems.push(`${model} cannot process images (no vision input). Choose a vision-capable model or remove the image.`);
+  }
+  if (state.attachments.some((a) => a.kind === 'doc' && a.status === 'uploading')) problems.push('A file is still uploading.');
+  if (state.attachments.some((a) => a.kind === 'doc' && a.status === 'error')) problems.push('Remove the attachment that failed to upload.');
+
+  // reasoning
+  if (!$('reasoning').disabled) {
+    const r = {};
+    if ($('reasoning').value) r.effort = $('reasoning').value;
+    if ($('reasoning-summary').value) r.summary = $('reasoning-summary').value;
+    if (!$('reasoning-mode-wrap').hidden && $('reasoning-mode').value) r.mode = $('reasoning-mode').value;
+    if (Object.keys(r).length) body.reasoning = r;
+  }
+
+  // generation parameters
+  const maxOut = numOrNull($('max-output').value);
+  if (maxOut !== null) {
+    if (isNaN(maxOut) || maxOut < 16 || !Number.isInteger(maxOut)) problems.push('Max output tokens must be a whole number of at least 16.');
+    else body.max_output_tokens = maxOut;
+  }
+  let sentTemp = false, sentTopP = false;
+  if (!$('temperature-num').disabled) {
+    const t = numOrNull($('temperature-num').value);
+    if (t !== null) { if (isNaN(t) || t < 0 || t > 2) problems.push('Temperature must be between 0 and 2.'); else { body.temperature = t; sentTemp = true; } }
+  }
+  if (!$('top-p-num').disabled) {
+    const p = numOrNull($('top-p-num').value);
+    if (p !== null) { if (isNaN(p) || p < 0 || p > 1) problems.push('Top P must be between 0 and 1.'); else { body.top_p = p; sentTopP = true; } }
+  }
+  if (sentTemp && sentTopP) warnings.push('Both Temperature and Top P are set. OpenAI recommends adjusting one of them.');
+
+  // tools
+  const tools = [], include = [];
+  if ($('tool-web').checked && !$('tool-web').disabled) {
+    const t = { type: 'web_search' };
+    if ($('web-context').value) t.search_context_size = $('web-context').value;
+    const loc = {};
+    const country = $('web-country').value.trim().toUpperCase(), city = $('web-city').value.trim(), region = $('web-region').value.trim();
+    if (country) { if (/^[A-Z]{2}$/.test(country)) loc.country = country; else problems.push('Web search country must be a 2-letter code.'); }
+    if (city) loc.city = city;
+    if (region) loc.region = region;
+    if (Object.keys(loc).length) t.user_location = { type: 'approximate', ...loc };
+    const domains = $('web-domains').value.split(',').map((d) => d.trim().replace(/^https?:\/\//, '')).filter(Boolean);
+    if (domains.length) t.filters = { allowed_domains: domains };
+    tools.push(t);
+    include.push('web_search_call.action.sources');
+    if (body.reasoning && body.reasoning.effort === 'minimal' && !override) warnings.push('Web search is not supported with Minimal reasoning on GPT-5 models.');
+  }
+  if ($('tool-files').checked && !$('tool-files').disabled) {
+    const vs = $('vs-select').value;
+    if (!vs) problems.push('File search needs a vector store — select one under Knowledge base.');
+    const t = { type: 'file_search', vector_store_ids: vs ? [vs] : [] };
+    const mx = numOrNull($('fs-max').value);
+    if (mx !== null) { if (isNaN(mx) || mx < 1 || mx > 50 || !Number.isInteger(mx)) problems.push('File search max results must be 1–50.'); else t.max_num_results = mx; }
+    tools.push(t);
+    if ($('fs-results').checked) include.push('file_search_call.results');
+  }
+  if ($('tool-code').checked && !$('tool-code').disabled) {
+    tools.push({ type: 'code_interpreter', container: { type: 'auto' } });
+    include.push('code_interpreter_call.outputs');
+  }
+  if ($('tool-image').checked && !$('tool-image').disabled) {
+    const t = { type: 'image_generation' };
+    for (const [field, id] of [['model', 'img-model'], ['size', 'img-size'], ['quality', 'img-quality'], ['output_format', 'img-format'], ['background', 'img-background'], ['moderation', 'img-moderation']]) {
+      const v = $(id).value.trim();
+      if (v) t[field] = v;
+    }
+    const comp = numOrNull($('img-compression').value);
+    if (comp !== null && !$('img-compression').disabled) { if (isNaN(comp) || comp < 0 || comp > 100) problems.push('Image compression must be 0–100.'); else t.output_compression = comp; }
+    tools.push(t);
+    if ($('img-force').checked) body.tool_choice = { type: 'image_generation' };
+  }
+  if (tools.length) body.tools = tools;
+  if (include.length) body.include = include;
+
+  // key order stays stable for readability
+  const order = ['model', 'instructions', 'input', 'reasoning', 'max_output_tokens', 'temperature', 'top_p', 'tools', 'tool_choice', 'include'];
+  const ordered = {};
+  for (const k of order) if (k in body) ordered[k] = body[k];
+
+  return { method: 'POST', url: RESPONSES_URL, headers: { Authorization: 'Bearer ********', 'Content-Type': 'application/json' }, body: ordered, problems, warnings };
+}
+
+function metaText(req) {
+  return `${req.method} ${req.url}\n` + Object.entries(req.headers).map(([k, v]) => `${k}: ${v}`).join('\n');
+}
+function curlText(req) {
+  const json = JSON.stringify(req.body, null, 2).replace(/'/g, "'\\''");
+  return `curl ${req.url} \\\n  -H "Authorization: Bearer $OPENAI_API_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '${json}'`;
+}
+
+/* ============================================================
+   8. Inspector
+   ============================================================ */
+function setTab(name) {
+  for (const t of document.querySelectorAll('.tab')) t.setAttribute('aria-selected', String(t.dataset.tab === name));
+  for (const p of document.querySelectorAll('.pane')) p.hidden = p.dataset.pane !== name;
+  if (name === 'errors') $('err-badge').hidden = true;
+  setInspectorOpen(true);
+}
+function setInspectorOpen(open) {
+  $('inspector-body').hidden = !open;
+  const b = $('inspector-toggle');
+  b.setAttribute('aria-expanded', String(open));
+  b.textContent = open ? '▾' : '▴';
+  b.setAttribute('aria-label', open ? 'Collapse inspector' : 'Expand inspector');
+}
+
+function renderRequestPane(req, label) {
+  $('inspector-label').textContent = label;
+  $('request-meta').textContent = metaText(req);
+  $('request-json').innerHTML = Highlight(JSON.stringify(shorten(req.body), null, 2), 'json');
+  state.lastRequest = req;
+  const box = $('request-problems');
+  box.innerHTML = '';
+  if (state.inspectorMode === 'preview') {
+    const shown = req.problems.filter((p) => state.showProblems || p.startsWith('File search') || /cannot process images/.test(p));
+    if (shown.length) box.appendChild(noticeList('err', 'This request cannot be sent yet:', shown));
+    if (req.warnings.length) box.appendChild(noticeList('warn', 'Heads up:', req.warnings));
+  }
+}
+
+function noticeList(kind, title, items) {
+  const d = document.createElement('div');
+  d.className = 'notice ' + kind;
+  d.innerHTML = `<strong>${esc(title)}</strong><ul>${items.map((i) => `<li>${esc(i)}</li>`).join('')}</ul>`;
+  return d;
+}
+
+function renderPreview() {
+  if (state.inspectorMode !== 'preview') return;
+  if (!state.ready) {
+    $('inspector-label').textContent = 'Preview';
+    $('request-meta').textContent = `POST ${RESPONSES_URL}`;
+    $('request-json').textContent = 'Initialize with an API key to see the request this app would send.';
+    $('request-problems').innerHTML = '';
+    renderComposerNote(null);
     return;
   }
+  const req = buildRequest();
+  renderRequestPane(req, 'Preview — what Run would send now');
+  renderComposerNote(req);
+}
 
-  if (rule.reasoning) {
-    for (const level of rule.reasoning) {
-      const option = el("option", "", level);
-      option.value = level;
-      reasoningSelect.append(option);
-    }
-    reasoningSelect.disabled = false;
-    setParamHint(reasoningHint, "");
+function renderComposerNote(req) {
+  const box = $('composer-note');
+  box.innerHTML = '';
+  if (!req) return;
+  const problems = req.problems.filter((p) => state.showProblems || /cannot process images/.test(p));
+  if (problems.length) box.appendChild(noticeList('err', 'Not sent:', problems));
+  if (req.warnings.length) box.appendChild(noticeList('warn', 'Heads up:', req.warnings));
+}
+
+function showTurnInspector(turn) {
+  state.selected = turn.n;
+  state.inspectorMode = 'turn';
+  renderRequestPane(turn.request, `Sent request · turn ${turn.n}`);
+  // response
+  if (turn.response) {
+    $('response-meta').textContent = `HTTP ${turn.response.status} · ${turn.response.ms} ms\n` + (turn.response.headers.length ? turn.response.headers.join('\n') : '(no response headers exposed to the browser)');
+    $('response-json').innerHTML = Highlight(JSON.stringify(shorten(turn.response.data), null, 2), 'json');
+    fillUsage(turn.response.data);
   } else {
-    reasoningSelect.disabled = true;
-    setParamHint(reasoningHint, "Not available for this model.");
+    $('response-meta').textContent = turn.error ? `No response body — request ended with an error.` : 'Waiting for response…';
+    $('response-json').textContent = turn.error ? 'See the Errors tab.' : '';
+    fillUsage(null);
   }
-
-  temperatureInput.disabled = !rule.sampling;
-  topPInput.disabled = !rule.sampling;
-  if (!rule.sampling) {
-    temperatureInput.value = "";
-    topPInput.value = "";
-  }
-  const samplingHint = rule.sampling ? "Change this or Top P, not both." : "Not available for this model.";
-  setParamHint(temperatureHint, samplingHint);
-  setParamHint(topPHint, samplingHint);
-
-  capabilityNote.textContent = rule.name + ". " + rule.source;
+  if (turn.error) fillError(turn.error, `Run · turn ${turn.n}`);
 }
 
+function fillUsage(data) {
+  const dl = $('usage-detail');
+  const usage = data && data.usage;
+  if (!usage) { dl.innerHTML = '<dt>Status</dt><dd>No usage returned.</dd>'; $('usage-json').textContent = ''; return; }
+  const rows = flatten(usage);
+  dl.innerHTML = rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('');
+  $('usage-json').innerHTML = Highlight(JSON.stringify(usage, null, 2), 'json');
+}
 
-/* ==================================================================
-   6. Image generation options
-   ================================================================== */
+function reportError(source, err) {
+  state.lastError = { source, err, at: stamp() };
+  fillError(err, source);
+  $('err-badge').hidden = false;
+}
 
-function fillImageModelSelect() {
-  imgModel.replaceChildren();
-  const def = el("option", "", "Tool default (not sent)");
-  def.value = "";
-  imgModel.append(def);
-  for (const id of IMAGE_TOOL_MODELS) {
-    if (!state.modelIds.includes(id)) continue;
-    const option = el("option", "", id);
-    option.value = id;
-    imgModel.append(option);
+function fillError(err, source) {
+  const box = $('error-view');
+  const title = err.kind === 'network' ? 'Network error' : err.kind === 'local' ? 'Not sent' : `HTTP ${err.status}${err.statusText ? ' ' + err.statusText : ''}`;
+  const rows = [['Source', source], ['HTTP status', err.status != null ? String(err.status) : '—'], ['Error type', err.type || '—'], ['Error code', err.code || '—'], ['Parameter', err.param || '—'], ['Message', err.message], ['Request ID', err.requestId || 'not available (not exposed to the browser or not returned)']];
+  const hint = hintFor(err);
+  box.innerHTML = `<p class="err-title">${esc(title)}</p><dl class="kv">${rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('')}</dl>` +
+    (hint ? `<p class="hint">${esc(hint)}</p>` : '') +
+    (err.raw ? `<pre class="pre">${esc(prettyRaw(err.raw))}</pre>` : '');
+}
+function prettyRaw(raw) { try { return JSON.stringify(JSON.parse(raw), null, 2); } catch (_) { return raw; } }
+
+function updateStats(data, model) {
+  const set = (k, v) => { document.querySelector(`[data-stat="${k}"]`).textContent = v; };
+  const u = data && data.usage;
+  set('model', (data && data.model) || model || $('model').value || '—');
+  set('input', u ? fmtNum(u.input_tokens) : '—');
+  set('output', u ? fmtNum(u.output_tokens) : '—');
+  set('total', u ? fmtNum(u.total_tokens) : '—');
+  const extra = [];
+  if (u && u.output_tokens_details && typeof u.output_tokens_details.reasoning_tokens === 'number') extra.push(`${fmtNum(u.output_tokens_details.reasoning_tokens)} reasoning`);
+  if (u && u.input_tokens_details && typeof u.input_tokens_details.cached_tokens === 'number' && u.input_tokens_details.cached_tokens > 0) extra.push(`${fmtNum(u.input_tokens_details.cached_tokens)} cached`);
+  $('usage-extra').textContent = extra.join(' · ');
+}
+
+/* ============================================================
+   9. Attachments (images inline; documents uploaded to the Files API)
+   ============================================================ */
+function refreshRunButton() {
+  const run = $('run');
+  run.textContent = state.busy ? 'Stop' : 'Run';
+  run.disabled = !state.ready;
+}
+function refreshUploadButton() {
+  const n = state.uploaded.length;
+  $('delete-uploads').disabled = !state.ready || n === 0 || state.busy;
+  $('delete-uploads').textContent = n ? `Delete uploads (${n})` : 'Delete uploads';
+}
+
+function renderAttachments(note, silent) {
+  const box = $('attachments');
+  box.innerHTML = '';
+  for (const a of state.attachments) {
+    const chip = document.createElement('span');
+    chip.className = 'chip' + (a.status === 'error' ? ' err' : '');
+    if (a.kind === 'image') { const im = document.createElement('img'); im.className = 'chip-thumb'; im.alt = ''; im.src = a.dataUrl; chip.appendChild(im); }
+    const name = document.createElement('span'); name.className = 'chip-name'; name.textContent = a.name; name.title = a.name; chip.appendChild(name);
+    const meta = document.createElement('span'); meta.className = 'muted';
+    meta.textContent = a.kind === 'image' ? fmtBytes(a.size) : a.status === 'uploading' ? 'uploading…' : a.status === 'error' ? 'failed' : a.fileId;
+    chip.appendChild(meta);
+    const x = document.createElement('button'); x.type = 'button'; x.textContent = '✕'; x.dataset.remove = a.id; x.setAttribute('aria-label', 'Remove ' + a.name);
+    chip.appendChild(x);
+    box.appendChild(chip);
   }
-}
-
-function fillImageQuality() {
-  const previous = imgQuality.value;
-  const levels = ["", "auto", "low", "medium", "high"];
-  if (IMAGE_QUALITY_EXTRA.test(imgModel.value)) levels.push("xhigh", "max");
-  imgQuality.replaceChildren();
-  for (const level of levels) {
-    const option = el("option", "", level === "" ? "Default" : level);
-    option.value = level;
-    imgQuality.append(option);
-  }
-  if (levels.includes(previous)) imgQuality.value = previous;
-}
-
-function updateImageCompression() {
-  const allowed = imgFormat.value === "jpeg" || imgFormat.value === "webp";
-  imgCompression.disabled = !allowed;
-  if (!allowed) imgCompression.value = "";
-}
-
-
-/* ==================================================================
-   7. Attachments (sent with this one request)
-   ================================================================== */
-
-function formatBytes(bytes) {
-  if (bytes < 1024) return bytes + " B";
-  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(0) + " KB";
-  return (bytes / (1024 * 1024)).toFixed(1) + " MB";
-}
-
-function renderAttachments() {
-  attachStatus.textContent = "";
-  attachmentsList.replaceChildren();
-  const groups = [["Image", state.images], ["Document", state.docs]];
-  for (const [label, list] of groups) {
-    list.forEach((file, index) => {
-      const item = el("li", "", label + ": " + file.name + " (" + formatBytes(file.size) + ")");
-      const remove = el("button", "", "x");
-      remove.type = "button";
-      remove.setAttribute("aria-label", "Remove " + file.name);
-      remove.addEventListener("click", () => { list.splice(index, 1); renderAttachments(); });
-      item.append(remove);
-      attachmentsList.append(item);
-    });
-  }
-}
-
-function addFiles(fileList, target, maxBytes, allowedTypes) {
-  const problems = [];
-  for (const file of Array.from(fileList)) {
-    if (allowedTypes && !allowedTypes.includes(file.type)) {
-      problems.push(file.name + ": unsupported image type (use PNG, JPEG, WEBP or non-animated GIF).");
-    } else if (file.size > maxBytes) {
-      problems.push(file.name + ": larger than " + formatBytes(maxBytes) + ".");
-    } else {
-      target.push(file);
-    }
-  }
-  renderAttachments();
-  attachStatus.textContent = problems.join(" ");
+  const imgs = state.attachments.filter((a) => a.kind === 'image').length;
+  const docs = state.attachments.filter((a) => a.kind === 'doc').length;
+  const parts = [];
+  if (imgs) parts.push(`${imgs} image${imgs > 1 ? 's' : ''} (sent inline)`);
+  if (docs) parts.push(`${docs} file${docs > 1 ? 's' : ''} (uploaded to OpenAI)`);
+  $('attach-status').textContent = note || parts.join(' · ');
+  refreshUploadButton();
+  if (!silent) onControlChange();
 }
 
 function readAsDataUrl(file) {
   return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = () => reject(new UserInputError("Could not read " + file.name + "."));
-    reader.readAsDataURL(file);
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(file);
   });
 }
 
-// Uploads a file to OpenAI's Files API and returns its id.
-// expireSeconds is optional (documented range: 3600 to 2592000). Used as a safety net
-// so a directly attached document disappears by itself even if the delete step fails.
-async function uploadFile(file, purpose, expireSeconds) {
-  const form = new FormData();
-  form.append("purpose", purpose);
-  if (expireSeconds) {
-    form.append("expires_after[anchor]", "created_at");
-    form.append("expires_after[seconds]", String(expireSeconds));
+async function addImages(files) {
+  const rejected = [];
+  for (const f of files) {
+    if (!/^image\/(png|jpe?g|webp|gif)$/.test(f.type)) { rejected.push(`${f.name}: unsupported type (use PNG, JPEG, WebP or GIF)`); continue; }
+    if (f.size > MAX_IMAGE_BYTES) { rejected.push(`${f.name}: larger than ${fmtBytes(MAX_IMAGE_BYTES)}`); continue; }
+    try { state.attachments.push({ id: uid(), kind: 'image', name: f.name, size: f.size, dataUrl: await readAsDataUrl(f) }); }
+    catch (e) { rejected.push(`${f.name}: could not be read`); }
   }
-  form.append("file", file, file.name);
-  const data = await callApi("POST", "/files", { form });
-  if (!data || !data.id) throw new UserInputError("OpenAI did not return a file id for " + file.name + ".");
-  return data.id;
+  renderAttachments(rejected.length ? 'Not added — ' + rejected.join('; ') : '');
 }
 
-
-/* ==================================================================
-   8. Vector stores (File Search)
-   ================================================================== */
-
-function logVs(message, isError) {
-  const item = el("li", isError ? "is-error" : "", message);
-  vsLog.append(item);
-  return item;
-}
-
-function selectedStoreIds() {
-  return Array.from(vsSelect.selectedOptions).map(option => option.value);
-}
-
-function renderVectorStores(keepSelected) {
-  vsSelect.replaceChildren();
-  for (const store of state.vectorStores) {
-    const counts = store.file_counts && typeof store.file_counts.completed === "number"
-      ? store.file_counts.completed + " files"
-      : "files unknown";
-    const option = el("option", "", (store.name || "(unnamed)") + "  " + store.id + "  " + counts);
-    option.value = store.id;
-    option.selected = keepSelected.includes(store.id);
-    vsSelect.append(option);
-  }
-}
-
-async function loadVectorStores(keepSelected = []) {
-  setBusy(true);
-  try {
-    const data = await callApi("GET", "/vector_stores?limit=100");
-    state.vectorStores = data && Array.isArray(data.data) ? data.data : [];
-    state.vectorStoresLoaded = true;
-    renderVectorStores(keepSelected);
-    if (state.vectorStores.length === 0) logVs("No vector stores yet. Create one below.");
-  } catch (error) {
-    logVs(explainError(error), true);
-  } finally {
-    setBusy(false);
-  }
-}
-
-async function createVectorStore() {
-  setBusy(true);
-  try {
-    const name = vsName.value.trim();
-    const created = await callApi("POST", "/vector_stores", { json: name ? { name } : {} });
-    vsName.value = "";
-    logVs("Created vector store " + created.id + ".");
-    await loadVectorStoresAfter(created.id);
-  } catch (error) {
-    logVs(explainError(error), true);
-  } finally {
-    setBusy(false);
-  }
-}
-
-async function loadVectorStoresAfter(newId) {
-  const keep = selectedStoreIds().concat(newId ? [newId] : []);
-  const data = await callApi("GET", "/vector_stores?limit=100");
-  state.vectorStores = data && Array.isArray(data.data) ? data.data : [];
-  state.vectorStoresLoaded = true;
-  renderVectorStores(keep);
-}
-
-// Upload each file, attach it to the selected store, and wait until it is processed.
-async function uploadToVectorStore() {
-  const storeIds = selectedStoreIds();
-  if (storeIds.length !== 1) {
-    logVs("Select exactly one vector store to add documents to.", true);
-    return;
-  }
-  const files = Array.from(vsFiles.files);
-  if (files.length === 0) {
-    logVs("Choose one or more documents first.", true);
-    return;
-  }
-
-  setBusy(true);
-  try {
-    for (const file of files) {
-      const line = logVs(file.name + ": uploading...");
-      try {
-        if (file.size > MAX_FILE_BYTES) throw new UserInputError("larger than " + formatBytes(MAX_FILE_BYTES));
-        const fileId = await uploadFile(file, "assistants");
-        let entry = await callApi("POST", "/vector_stores/" + storeIds[0] + "/files", { json: { file_id: fileId } });
-        line.textContent = file.name + ": processing...";
-        const started = Date.now();
-        while (entry.status === "in_progress" && Date.now() - started < POLL_TIMEOUT_MS) {
-          await sleep(POLL_INTERVAL_MS);
-          entry = await callApi("GET", "/vector_stores/" + storeIds[0] + "/files/" + fileId);
-        }
-        if (entry.status === "completed") {
-          line.textContent = file.name + ": ready.";
-        } else if (entry.status === "in_progress") {
-          line.textContent = file.name + ": still processing. Refresh the list later.";
-        } else {
-          const reason = entry.last_error && entry.last_error.message ? " " + entry.last_error.message : "";
-          line.textContent = file.name + ": " + entry.status + "." + reason;
-          line.className = "is-error";
-        }
-      } catch (error) {
-        line.textContent = file.name + ": " + explainError(error);
-        line.className = "is-error";
-      }
-    }
-    vsFiles.value = "";
-    await loadVectorStoresAfter(null);
-  } catch (error) {
-    logVs(explainError(error), true);
-  } finally {
-    setBusy(false);
-  }
-}
-
-
-/* ==================================================================
-   9. Building the request
-   ================================================================== */
-
-// Reads an optional number field. Empty means "do not send".
-function readNumber(input, label, { min, max, integer }) {
-  const raw = input.value.trim();
-  if (raw === "") return undefined;
-  const value = Number(raw);
-  if (!Number.isFinite(value) || (integer && !Number.isInteger(value)) || value < min || value > max) {
-    const range = max === Infinity ? "at least " + min : "between " + min + " and " + max;
-    throw new UserInputError(label + " must be " + (integer ? "a whole number " : "a number ") + range + ".");
-  }
-  return value;
-}
-
-function buildTools() {
-  const tools = [];
-  const include = [];
-  let toolChoice;
-
-  if (toolWeb.checked) {
-    const tool = { type: "web_search" };
-    if (webContext.value) tool.search_context_size = webContext.value;
-    tools.push(tool);
-    include.push("web_search_call.action.sources");
-  }
-
-  if (toolFiles.checked) {
-    const ids = selectedStoreIds();
-    if (ids.length === 0) {
-      throw new UserInputError("File Search is ticked but no vector store is selected. Select one, or untick File Search.");
-    }
-    tools.push({ type: "file_search", vector_store_ids: ids });
-  }
-
-  if (toolImage.checked) {
-    const tool = { type: "image_generation" };
-    if (imgModel.value) tool.model = imgModel.value;
-    if (imgSize.value) tool.size = imgSize.value;
-    if (imgQuality.value) tool.quality = imgQuality.value;
-    if (imgFormat.value) tool.output_format = imgFormat.value;
-    if (imgBackground.value) tool.background = imgBackground.value;
-    if (imgModeration.value) tool.moderation = imgModeration.value;
-    const compression = readNumber(imgCompression, "Compression", { min: 0, max: 100, integer: true });
-    if (compression !== undefined) tool.output_compression = compression;
-    if (tool.background === "transparent" && tool.output_format === "jpeg") {
-      throw new UserInputError("A transparent background needs the png or webp format, not jpeg.");
-    }
-    tools.push(tool);
-    if (imgForce.checked) toolChoice = { type: "image_generation" };
-  }
-
-  return { tools, include, toolChoice };
-}
-
-// Turns the form into the JSON body for POST /v1/responses.
-// Only documented parameters that apply to the chosen model are added.
-// Documents are uploaded here, and their ids are recorded in `uploadedIds`.
-async function buildRequestBody(uploadedIds) {
-  const model = modelSelect.value;
-  const prompt = promptInput.value.trim();
-  if (!model) throw new UserInputError("Select a model.");
-  if (!prompt) throw new UserInputError("Write a prompt.");
-  const rule = ruleFor(model);
-
-  const body = { model };
-
-  const maxTokens = readNumber(maxOutput, "Max output tokens", { min: 16, max: Infinity, integer: true });
-  if (maxTokens !== undefined) body.max_output_tokens = maxTokens;
-
-  if (rule.reasoning && reasoningSelect.value && rule.reasoning.includes(reasoningSelect.value)) {
-    body.reasoning = { effort: reasoningSelect.value };
-  }
-  if (rule.sampling) {
-    const temperature = readNumber(temperatureInput, "Temperature", { min: 0, max: 2 });
-    if (temperature !== undefined) body.temperature = temperature;
-    const topP = readNumber(topPInput, "Top P", { min: 0, max: 1 });
-    if (topP !== undefined) body.top_p = topP;
-  }
-
-  const instructions = instructionsInput.value.trim();
-  if (instructions) body.instructions = instructions;
-
-  const { tools, include, toolChoice } = buildTools();
-  if (tools.length) body.tools = tools;
-  if (include.length) body.include = include;
-  if (toolChoice) body.tool_choice = toolChoice;
-
-  if (state.images.length === 0 && state.docs.length === 0) {
-    body.input = prompt;
-  } else {
-    const content = [{ type: "input_text", text: prompt }];
-    for (const file of state.images) {
-      content.push({ type: "input_image", image_url: await readAsDataUrl(file) });
-    }
-    for (const file of state.docs) {
-      const id = await uploadFile(file, "user_data", deleteUploads.checked ? 3600 : 0);
-      uploadedIds.push(id);
-      content.push({ type: "input_file", file_id: id });
-    }
-    body.input = [{ role: "user", content }];
-  }
-  return body;
-}
-
-// A readable copy of the body for the "Request sent" box. Long data URLs are shortened.
-function previewBody(body) {
-  return JSON.stringify(body, (key, value) => {
-    if (typeof value === "string" && value.startsWith("data:") && value.length > 80) {
-      return value.slice(0, 40) + "... (" + value.length + " characters)";
-    }
-    return value;
-  }, 2);
-}
-
-
-/* ==================================================================
-   10. Markdown (built from DOM nodes, never from HTML strings)
-   ================================================================== */
-
-const LIST_RE = /^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$/;
-const FENCE_RE = /^\s{0,3}(`{3,}|~{3,})\s*([^\s`]*).*$/;
-const HEADING_RE = /^\s{0,3}(#{1,6})\s+(.*?)(?:\s+#+)?\s*$/;
-const HR_RE = /^\s{0,3}([-*_])(?:\s*\1){2,}\s*$/;
-const QUOTE_RE = /^\s{0,3}>/;
-const TABLE_SEP_RE = /^\s*\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)*\|?\s*$/;
-const BLANK_RE = /^\s*$/;
-
-const indentOf = line => line.length - line.trimStart().length;
-
-// Links are only kept for http, https and mailto. Anything else becomes plain text.
-function safeHref(raw) {
-  try {
-    const url = new URL(raw);
-    return ["http:", "https:", "mailto:"].includes(url.protocol) ? url.href : null;
-  } catch (error) {
-    return null;
-  }
-}
-
-function makeLink(href, node) {
-  const link = el("a");
-  link.href = href;
-  link.target = "_blank";
-  link.rel = "noopener noreferrer";
-  if (node) link.append(node);
-  return link;
-}
-
-const PUNCT_RE = /[\p{P}\p{S}]/u;
-const LINK_RE = /(!?)\[([^\]]+)\]\(\s*<?((?:[^()\s>]|\([^()\s]*\))+)>?(?:\s+"[^"]*")?\s*\)/y;
-const AUTOLINK_RE = /<(https?:\/\/[^>\s]+)>/y;
-const BARE_URL_RE = /https?:\/\/[^\s<>()\]]*[^\s<>()\].,;:!?"']/y;
-
-function appendPlain(parent, text) {
-  const parts = text.split("\n");
-  parts.forEach((part, index) => {
-    if (index > 0) parent.append(el("br"));
-    if (part) parent.append(document.createTextNode(part));
-  });
-}
-
-// Start and end of the text count as whitespace, as in CommonMark.
-const isSpace = ch => ch === undefined || /\s/.test(ch);
-const isPunct = ch => ch !== undefined && PUNCT_RE.test(ch);
-
-function buildLink(match) {
-  const href = safeHref(match[3]);
-  if (match[1] === "!") {
-    // Images are never loaded from the network: they become a link.
-    const label = "[image: " + match[2] + "]";
-    if (!href) return document.createTextNode(label);
-    const link = makeLink(href);
-    link.textContent = label;
-    return link;
-  }
-  if (!href) {
-    const plain = document.createDocumentFragment();
-    renderInline(match[2], plain);
-    return plain;
-  }
-  const link = makeLink(href);
-  renderInline(match[2], link);
-  return link;
-}
-
-// Step 1: split text into plain text, finished DOM nodes (code, links) and
-// runs of * _ ~ that may become emphasis.
-function tokenizeInline(text) {
-  const nodes = [];
-  let buffer = "";
-  const flush = () => { if (buffer) { nodes.push({ t: "text", v: buffer }); buffer = ""; } };
-  let i = 0;
-
-  while (i < text.length) {
-    const ch = text[i];
-
-    if (ch === "\\" && i + 1 < text.length && isPunct(text[i + 1])) {
-      buffer += text[i + 1];
-      i += 2;
+async function addDocs(files) {
+  for (const f of files) {
+    const att = { id: uid(), kind: 'doc', name: f.name, size: f.size, status: 'uploading' };
+    state.attachments.push(att);
+    renderAttachments();
+    try {
+      const form = new FormData();
+      form.append('purpose', 'user_data');
+      form.append('file', f, f.name);
+      const { data } = await api('POST', '/files', { form });
+      att.fileId = data.id; att.status = 'ready';
+      state.uploaded.push({ id: data.id, name: f.name });
+    } catch (e) {
+      const ex = e instanceof ApiError ? e : networkError(e);
+      att.status = 'error';
+      reportError('File upload', ex);
+      renderAttachments(`Upload failed for ${f.name} — ${errorLine(ex)}`);
       continue;
     }
-
-    if (ch === "`") {
-      let j = i;
-      while (text[j] === "`") j++;
-      const run = text.slice(i, j);
-      let close = -1;
-      for (let k = text.indexOf(run, j); k !== -1; k = text.indexOf(run, k + 1)) {
-        if (text[k - 1] !== "`" && text[k + run.length] !== "`") { close = k; break; }
-      }
-      if (close === -1) { buffer += run; i = j; continue; }
-      let code = text.slice(j, close).replace(/\n/g, " ");
-      if (code.length > 1 && code.startsWith(" ") && code.endsWith(" ") && code.trim()) code = code.slice(1, -1);
-      flush();
-      nodes.push({ t: "dom", n: el("code", "", code) });
-      i = close + run.length;
-      continue;
-    }
-
-    if (ch === "[" || (ch === "!" && text[i + 1] === "[")) {
-      LINK_RE.lastIndex = i;
-      const m = LINK_RE.exec(text);
-      if (m) { flush(); nodes.push({ t: "dom", n: buildLink(m) }); i += m[0].length; continue; }
-    }
-
-    if (ch === "<") {
-      AUTOLINK_RE.lastIndex = i;
-      const m = AUTOLINK_RE.exec(text);
-      const href = m && safeHref(m[1]);
-      if (href) { flush(); nodes.push({ t: "dom", n: makeLink(href, document.createTextNode(m[1])) }); i += m[0].length; continue; }
-    }
-
-    if (ch === "h" && text.startsWith("http", i) && !/[A-Za-z0-9]/.test(text[i - 1] || "")) {
-      BARE_URL_RE.lastIndex = i;
-      const m = BARE_URL_RE.exec(text);
-      const href = m && safeHref(m[0]);
-      if (href) { flush(); nodes.push({ t: "dom", n: makeLink(href, document.createTextNode(m[0])) }); i += m[0].length; continue; }
-    }
-
-    if (ch === "*" || ch === "_" || ch === "~") {
-      let j = i;
-      while (text[j] === ch) j++;
-      const count = j - i;
-      if (ch === "~" && count < 2) { buffer += text.slice(i, j); i = j; continue; }
-      const prev = text[i - 1];
-      const next = text[j];
-      const left = !isSpace(next) && (!isPunct(next) || isSpace(prev) || isPunct(prev));
-      const right = !isSpace(prev) && (!isPunct(prev) || isSpace(next) || isPunct(next));
-      let open = left;
-      let close = right;
-      if (ch === "_") {                       // underscores never open or close inside a word
-        open = left && (!right || isPunct(prev));
-        close = right && (!left || isPunct(next));
-      }
-      flush();
-      nodes.push({ t: "delim", ch, count, orig: count, open, close });
-      i = j;
-      continue;
-    }
-
-    buffer += ch;
-    i++;
-  }
-  flush();
-  return nodes;
-}
-
-// Step 2: match opening and closing runs (the CommonMark delimiter algorithm).
-// Runs that never match stay as literal characters.
-function processEmphasis(nodes) {
-  for (let ci = 0; ci < nodes.length; ci++) {
-    const closer = nodes[ci];
-    if (closer.t !== "delim" || !closer.close || closer.count === 0) continue;
-
-    let found = -1;
-    for (let oi = ci - 1; oi >= 0; oi--) {
-      const opener = nodes[oi];
-      if (opener.t !== "delim" || opener.ch !== closer.ch || !opener.open || opener.count === 0) continue;
-      if (closer.ch === "~") {
-        if (opener.count < 2 || closer.count < 2) continue;
-      } else if ((opener.close || closer.open) && (opener.orig + closer.orig) % 3 === 0 &&
-                 !(opener.orig % 3 === 0 && closer.orig % 3 === 0)) {
-        continue;
-      }
-      found = oi;
-      break;
-    }
-    if (found < 0) continue;
-
-    const opener = nodes[found];
-    const use = closer.ch === "~" ? 2 : (opener.count >= 2 && closer.count >= 2 ? 2 : 1);
-    const kind = closer.ch === "~" ? "del" : (use === 2 ? "strong" : "em");
-    const inner = nodes.splice(found + 1, ci - found - 1);
-    const children = inner.map(n => n.t === "delim" ? { t: "text", v: n.ch.repeat(n.count) } : n);
-    opener.count -= use;
-    closer.count -= use;
-    nodes.splice(found + 1, 0, { t: kind, children });
-    ci = found + 1;                           // the closer is now at found + 2 and is checked again
+    renderAttachments();
   }
 }
 
-// Step 3: turn the node list into DOM elements.
-function emitInline(nodes, parent) {
-  for (const node of nodes) {
-    if (node.t === "text") appendPlain(parent, node.v);
-    else if (node.t === "dom") parent.append(node.n);
-    else if (node.t === "delim") { if (node.count > 0) appendPlain(parent, node.ch.repeat(node.count)); }
-    else {
-      const wrapper = el(node.t);
-      emitInline(node.children, wrapper);
-      parent.append(wrapper);
-    }
+async function removeAttachment(id) {
+  const i = state.attachments.findIndex((a) => a.id === id);
+  if (i < 0) return;
+  const [att] = state.attachments.splice(i, 1);
+  renderAttachments();
+  if (att.kind === 'doc' && att.fileId) await deleteRemoteFiles([att.fileId], true);
+}
+
+async function deleteRemoteFiles(ids, quiet) {
+  let ok = 0; const failed = [];
+  for (const fid of ids) {
+    try { await api('DELETE', '/files/' + fid); ok++; state.uploaded = state.uploaded.filter((u) => u.id !== fid); state.attachments = state.attachments.filter((a) => a.fileId !== fid); }
+    catch (e) { const ex = e instanceof ApiError ? e : networkError(e); failed.push(`${fid}: ${errorLine(ex)}`); reportError('Delete upload', ex); }
+  }
+  renderAttachments(failed.length ? `Deleted ${ok}, failed ${failed.length} — ${failed.join('; ')}` : quiet ? '' : `Deleted ${ok} uploaded file${ok === 1 ? '' : 's'} from OpenAI.`);
+}
+
+/* ============================================================
+   10. Run + rendering
+   ============================================================ */
+function scrollChat(force) {
+  const sc = $('chat-scroll');
+  if (force || sc.scrollHeight - sc.scrollTop - sc.clientHeight < 160) sc.scrollTop = sc.scrollHeight;
+}
+
+function addTurn(req, attachments) {
+  $('empty-state')?.remove();
+  const n = state.turns.length + 1;
+  const turn = { n, request: req, response: null, error: null };
+  const el = document.createElement('article');
+  el.className = 'turn';
+  const user = document.createElement('div'); user.className = 'msg user';
+  const bubble = document.createElement('div'); bubble.className = 'bubble';
+  const prompt = typeof req.body.input === 'string' ? req.body.input : ((req.body.input[0].content.find((p) => p.type === 'input_text') || {}).text || '');
+  bubble.textContent = prompt;
+  if (attachments.length) {
+    const chips = document.createElement('div'); chips.className = 'chips';
+    for (const a of attachments) { const c = document.createElement('span'); c.className = 'chip'; c.textContent = (a.kind === 'image' ? 'image · ' : 'file · ') + a.name; chips.appendChild(c); }
+    bubble.appendChild(chips);
+  }
+  user.appendChild(bubble);
+  const asst = document.createElement('div'); asst.className = 'msg assistant';
+  const body = document.createElement('div'); body.className = 'assistant-body md';
+  const pend = document.createElement('div'); pend.className = 'pending'; pend.textContent = 'Waiting for response…';
+  body.appendChild(pend);
+  const meta = document.createElement('div'); meta.className = 'turn-meta';
+  asst.append(body, meta);
+  el.append(user, asst);
+  $('response').appendChild(el);
+  turn.el = el; turn.body = body; turn.metaEl = meta; turn.pendEl = pend;
+  state.turns.push(turn);
+  scrollChat(true);
+  return turn;
+}
+
+function metaLinks(turn, statusText) {
+  const m = turn.metaEl;
+  m.innerHTML = '';
+  const s = document.createElement('span'); s.textContent = statusText; m.appendChild(s);
+  const ins = document.createElement('button'); ins.type = 'button'; ins.className = 'link'; ins.textContent = 'Inspect'; ins.dataset.inspect = turn.n; m.appendChild(ins);
+  if (turn.response) {
+    const cp = document.createElement('button'); cp.type = 'button'; cp.className = 'link'; cp.textContent = 'Copy answer'; cp.dataset.copyAnswer = turn.n; m.appendChild(cp);
   }
 }
 
-function renderInline(text, parent) {
-  const nodes = tokenizeInline(text);
-  processEmphasis(nodes);
-  emitInline(nodes, parent);
+function textOf(data) {
+  const out = [];
+  for (const it of data.output || []) if (it.type === 'message') for (const c of it.content || []) if (c.type === 'output_text') out.push(c.text);
+  return out.join('\n\n');
 }
 
-function startsBlock(line) {
-  return FENCE_RE.test(line) || HEADING_RE.test(line) || HR_RE.test(line) || QUOTE_RE.test(line) || LIST_RE.test(line);
+function toolCall(title, obj) {
+  const d = document.createElement('details');
+  d.className = 'tool-call';
+  const s = document.createElement('summary'); s.textContent = title; d.appendChild(s);
+  const pre = document.createElement('pre'); pre.className = 'pre'; pre.innerHTML = Highlight(JSON.stringify(shorten(obj), null, 2), 'json');
+  d.appendChild(pre);
+  return d;
 }
 
-function isTableStart(lines, i) {
-  return i + 1 < lines.length && lines[i].includes("|") && lines[i + 1].includes("|") && TABLE_SEP_RE.test(lines[i + 1]);
-}
-
-function splitRow(line) {
-  let text = line.trim();
-  if (text.startsWith("|")) text = text.slice(1);
-  if (text.endsWith("|") && !text.endsWith("\\|")) text = text.slice(0, -1);
-  const cells = [];
-  let current = "";
-  for (let i = 0; i < text.length; i++) {
-    if (text[i] === "\\" && text[i + 1] === "|") { current += "|"; i++; }
-    else if (text[i] === "|") { cells.push(current.trim()); current = ""; }
-    else current += text[i];
-  }
-  cells.push(current.trim());
-  return cells;
-}
-
-function renderTable(lines, start, parent) {
-  const head = splitRow(lines[start]);
-  const aligns = splitRow(lines[start + 1]).map(cell => {
-    if (cell.startsWith(":") && cell.endsWith(":")) return "al-center";
-    if (cell.endsWith(":")) return "al-right";
-    return "";
-  });
-  const table = el("table");
-  const headRow = el("tr");
-  head.forEach((cell, index) => {
-    const th = el("th", aligns[index] || "");
-    renderInline(cell, th);
-    headRow.append(th);
-  });
-  const thead = el("thead");
-  thead.append(headRow);
-  table.append(thead);
-
-  const bodyEl = el("tbody");
-  let i = start + 2;
-  while (i < lines.length && !BLANK_RE.test(lines[i]) && lines[i].includes("|")) {
-    const row = el("tr");
-    const cells = splitRow(lines[i]);
-    head.forEach((_, index) => {
-      const td = el("td", aligns[index] || "");
-      renderInline(cells[index] || "", td);
-      row.append(td);
-    });
-    bodyEl.append(row);
-    i++;
-  }
-  table.append(bodyEl);
-  const wrap = el("div", "table-wrap");
-  wrap.append(table);
-  parent.append(wrap);
-  return i;
-}
-
-function renderList(lines, start, parent) {
-  const first = lines[start].match(LIST_RE);
-  const baseIndent = first[1].length;
-  const ordered = /^\d/.test(first[2]);
-  const list = el(ordered ? "ol" : "ul");
-  if (ordered) {
-    const number = parseInt(first[2], 10);
-    if (number > 1) list.setAttribute("start", String(number));
-  }
-
-  let i = start;
-  while (i < lines.length) {
-    const m = lines[i].match(LIST_RE);
-    if (!m || m[1].length >= baseIndent + 2 || m[1].length < baseIndent || /^\d/.test(m[2]) !== ordered) break;
-
-    const itemLines = [m[3]];
-    let loose = false;
-    i++;
-    while (i < lines.length) {
-      const line = lines[i];
-      if (BLANK_RE.test(line)) {
-        let j = i;
-        while (j < lines.length && BLANK_RE.test(lines[j])) j++;
-        if (j < lines.length && indentOf(lines[j]) >= baseIndent + 2) {
-          for (let k = i; k < j; k++) itemLines.push("");
-          loose = true;
-          i = j;
-          continue;
-        }
-        break;
-      }
-      if (indentOf(line) >= baseIndent + 2) {
-        itemLines.push(line.slice(Math.min(indentOf(line), baseIndent + 2)));
-        i++;
-      } else if (LIST_RE.test(line) || startsBlock(line)) {
-        break;
-      } else {
-        itemLines.push(line.trim());          // lazy continuation of the item's text
-        i++;
-      }
-    }
-
-    const item = el("li");
-    const holder = el("div");
-    renderBlocks(itemLines, holder);
-    if (!loose) {
-      for (const child of Array.from(holder.children)) {
-        if (child.tagName === "P") {
-          while (child.firstChild) holder.insertBefore(child.firstChild, child);
-          holder.removeChild(child);
-        }
-      }
-    }
-    while (holder.firstChild) item.append(holder.firstChild);
-    list.append(item);
-  }
-  parent.append(list);
-  return i;
-}
-
-function renderBlocks(lines, parent) {
-  let i = 0;
-  while (i < lines.length) {
-    const line = lines[i];
-    if (BLANK_RE.test(line)) { i++; continue; }
-
-    let m = line.match(FENCE_RE);
-    if (m) {
-      const fence = m[1];
-      const closing = new RegExp("^\\s{0,3}" + fence[0] + "{" + fence.length + ",}\\s*$");
-      const body = [];
-      i++;
-      while (i < lines.length && !closing.test(lines[i])) { body.push(lines[i]); i++; }
-      i++;
-      const pre = el("pre");
-      const code = el("code", m[2] ? "language-" + m[2].replace(/[^\w-]/g, "") : "");
-      code.textContent = body.join("\n");
-      pre.append(code);
-      parent.append(pre);
-      continue;
-    }
-
-    m = line.match(HEADING_RE);
-    if (m) {
-      const heading = el("h" + m[1].length);
-      renderInline(m[2], heading);
-      parent.append(heading);
-      i++;
-      continue;
-    }
-
-    if (HR_RE.test(line)) { parent.append(el("hr")); i++; continue; }
-
-    if (isTableStart(lines, i)) { i = renderTable(lines, i, parent); continue; }
-
-    if (QUOTE_RE.test(line)) {
-      const inner = [];
-      while (i < lines.length && QUOTE_RE.test(lines[i])) {
-        inner.push(lines[i].replace(/^\s{0,3}>\s?/, ""));
-        i++;
-      }
-      const quote = el("blockquote");
-      renderBlocks(inner, quote);
-      parent.append(quote);
-      continue;
-    }
-
-    if (LIST_RE.test(line)) { i = renderList(lines, i, parent); continue; }
-
-    const paragraph = [line];
-    i++;
-    while (i < lines.length && !BLANK_RE.test(lines[i]) && !startsBlock(lines[i]) && !isTableStart(lines, i)) {
-      paragraph.push(lines[i]);
-      i++;
-    }
-    const p = el("p");
-    renderInline(paragraph.map(text => text.trim()).join("\n"), p);
-    parent.append(p);
-  }
-}
-
-function renderMarkdown(source, parent) {
-  const lines = String(source).replace(/\r\n?/g, "\n").replace(/\t/g, "    ").split("\n");
-  renderBlocks(lines, parent);
-}
-
-
-/* ==================================================================
-   11. Showing the response
-   ================================================================== */
-
-let downloadUrls = [];
-
-// kind is "empty", "loading", "error", or nothing for a normal answer.
-function setResponse(text, kind) {
-  for (const url of downloadUrls) URL.revokeObjectURL(url);
-  downloadUrls = [];
-  responseBox.replaceChildren();
-  responseBox.className = "response" + (kind ? " is-" + kind : "");
-  responseBox.textContent = text;
-}
-
-function showNotice(text) {
-  responseBox.append(el("div", "notice", text));
-}
-
-const IMAGE_MIME = { png: "image/png", jpeg: "image/jpeg", webp: "image/webp" };
-
-function base64ToBlob(base64, mime) {
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return new Blob([bytes], { type: mime });
-}
-
-// Reads the "output" array of a Responses API answer.
-function parseResponse(data) {
-  const result = {
-    texts: [], images: [], links: [], files: [], notes: [],
-    status: data.status || "", incomplete: "", error: null,
-    model: data.model || "", usage: data.usage || null,
-  };
-  if (data.error) result.error = data.error.message || "The response reports an error.";
-  if (data.incomplete_details && data.incomplete_details.reason) result.incomplete = data.incomplete_details.reason;
-
-  const addLink = (url, title) => {
-    if (url && !result.links.some(link => link.url === url)) result.links.push({ url, title: title || url });
-  };
-
-  for (const item of data.output || []) {
-    if (item.type === "message") {
-      for (const part of item.content || []) {
-        if (part.type === "output_text") {
-          result.texts.push(part.text || "");
-          for (const note of part.annotations || []) {
-            if (note.type === "url_citation") addLink(note.url, note.title);
-            if (note.type === "file_citation" && note.filename && !result.files.includes(note.filename)) {
-              result.files.push(note.filename);
+function renderOutput(turn, data, req) {
+  const box = turn.body;
+  box.innerHTML = '';
+  const tool = (req.body.tools || []).find((t) => t.type === 'image_generation') || {};
+  let shown = false;
+  for (const it of data.output || []) {
+    switch (it.type) {
+      case 'message': {
+        for (const c of it.content || []) {
+          if (c.type === 'output_text') {
+            const d = document.createElement('div'); d.innerHTML = Md.render(c.text || ''); box.appendChild(d); shown = true;
+            const cites = [];
+            for (const a of c.annotations || []) {
+              if (a.type === 'url_citation') cites.push({ label: a.title || a.url, url: a.url });
+              else if (a.type === 'file_citation' || a.type === 'container_file_citation') cites.push({ label: a.filename || a.file_id });
             }
+            const uniq = cites.filter((x, i) => cites.findIndex((y) => y.label === x.label && y.url === x.url) === i);
+            if (uniq.length) {
+              const ol = document.createElement('ol'); ol.className = 'sources';
+              for (const s of uniq) {
+                const li = document.createElement('li');
+                if (s.url && /^https?:/i.test(s.url)) { const a = document.createElement('a'); a.href = s.url; a.target = '_blank'; a.rel = 'noopener noreferrer'; a.textContent = s.label; li.appendChild(a); }
+                else li.textContent = s.label;
+                ol.appendChild(li);
+              }
+              box.appendChild(ol);
+            }
+          } else if (c.type === 'refusal') {
+            const n = document.createElement('div'); n.className = 'notice warn'; n.textContent = 'The model refused: ' + (c.refusal || ''); box.appendChild(n); shown = true;
           }
-        } else if (part.type === "refusal") {
-          result.texts.push(part.refusal || "The model refused this request.");
         }
+        break;
       }
-    } else if (item.type === "image_generation_call") {
-      if (item.result) {
-        result.images.push({
-          base64: item.result, format: item.output_format || "png", size: item.size || "",
-          quality: item.quality || "", revised: item.revised_prompt || "",
-        });
-      } else {
-        result.notes.push("Image generation returned no image (status: " + (item.status || "unknown") + ").");
+      case 'reasoning': {
+        const sum = (it.summary || []).map((s) => s.text).filter(Boolean).join('\n\n');
+        if (sum) { const d = document.createElement('details'); d.className = 'tool-call'; const s = document.createElement('summary'); s.textContent = 'Reasoning summary'; const b = document.createElement('div'); b.className = 'md pre'; b.innerHTML = Md.render(sum); d.append(s, b); box.appendChild(d); }
+        break;
       }
-    } else if (item.type === "web_search_call") {
-      result.notes.push("Web search ran.");
-      const sources = item.action && item.action.sources;
-      for (const source of sources || []) addLink(source.url);
-    } else if (item.type === "file_search_call") {
-      const queries = (item.queries || []).join("; ");
-      result.notes.push("File Search ran" + (queries ? ": " + queries : "."));
+      case 'web_search_call': {
+        const q = it.action && (it.action.query || (it.action.queries || []).join(' · '));
+        box.appendChild(toolCall('Web search' + (q ? ' · ' + q : ''), it)); break;
+      }
+      case 'file_search_call': box.appendChild(toolCall('File search' + (it.queries ? ' · ' + it.queries.join(' · ') : ''), it)); break;
+      case 'code_interpreter_call': {
+        box.appendChild(toolCall('Code interpreter', it));
+        if (it.code) box.insertAdjacentHTML('beforeend', '<div class="md">' + Md.render('```python\n' + it.code + '\n```') + '</div>');
+        break;
+      }
+      case 'image_generation_call': {
+        if (it.result) {
+          const fmt = it.output_format || tool.output_format || 'png';
+          const src = `data:image/${/^[a-z0-9]+$/.test(fmt) ? fmt : 'png'};base64,${it.result}`;
+          const img = document.createElement('img'); img.className = 'gen-img'; img.alt = 'Generated image'; img.src = src;
+          box.appendChild(img); shown = true;
+          if (it.revised_prompt) { const p = document.createElement('p'); p.className = 'hint'; p.textContent = 'Revised prompt: ' + it.revised_prompt; box.appendChild(p); }
+        } else box.appendChild(toolCall('Image generation', it));
+        break;
+      }
+      default: box.appendChild(toolCall(`Output item · ${it.type}`, it));
     }
   }
-  return result;
-}
-
-function renderImages(images) {
-  const wrap = el("div", "gen-images");
-  for (const image of images) {
-    if (!/^[A-Za-z0-9+/=\s]+$/.test(image.base64)) continue;
-    const mime = IMAGE_MIME[image.format] || "image/png";
-    const figure = el("figure", "gen-image");
-    const img = el("img");
-    img.alt = image.revised || "Generated image";
-    img.src = "data:" + mime + ";base64," + image.base64;
-    figure.append(img);
-
-    const caption = el("figcaption");
-    const details = [image.format, image.size, image.quality && "quality " + image.quality].filter(Boolean).join(", ");
-    caption.append(document.createTextNode(details + " "));
-    try {
-      const url = URL.createObjectURL(base64ToBlob(image.base64.replace(/\s/g, ""), mime));
-      downloadUrls.push(url);
-      const link = el("a", "", "Download");
-      link.href = url;
-      link.download = "generated-image." + (image.format === "jpeg" ? "jpg" : image.format);
-      caption.append(link);
-    } catch (error) {
-      // No download link if the browser cannot build one.
-    }
-    figure.append(caption);
-    wrap.append(figure);
+  if (data.status === 'incomplete') {
+    const why = data.incomplete_details && data.incomplete_details.reason;
+    const n = document.createElement('div'); n.className = 'notice warn';
+    n.textContent = `Response incomplete${why ? ' (' + why + ')' : ''}.` + (why === 'max_output_tokens' ? (shown ? ' Increase Max output tokens for a full answer.' : ' The limit was reached before any visible text — reasoning tokens count against it. Increase Max output tokens.') : '');
+    box.appendChild(n);
+  } else if (data.status === 'failed' && data.error) {
+    const n = document.createElement('div'); n.className = 'notice err'; n.textContent = `Response failed: ${data.error.code || ''} ${data.error.message || ''}`; box.appendChild(n);
   }
-  return wrap;
-}
-
-function renderSources(result) {
-  if (result.links.length === 0 && result.files.length === 0) return null;
-  const box = el("div", "sources");
-  box.append(el("h3", "", "Sources"));
-  const list = el("ul");
-  for (const source of result.links) {
-    const item = el("li");
-    const href = safeHref(source.url);
-    if (href) item.append(makeLink(href, document.createTextNode(source.title)));
-    else item.append(document.createTextNode(source.title));
-    list.append(item);
-  }
-  for (const name of result.files) list.append(el("li", "", "File: " + name));
-  box.append(list);
-  return box;
-}
-
-function setUsage(rows) {
-  usageList.replaceChildren();
-  for (const [label, value] of rows) {
-    const wrap = el("div");
-    wrap.append(el("dt", "", label), el("dd", "", value));
-    usageList.append(wrap);
-  }
-}
-
-function formatNumber(value) {
-  return typeof value === "number" ? value.toLocaleString("en-US") : "-";
-}
-
-// Shows only what the response's usage object reports. Nothing is estimated.
-function showUsage(result) {
-  const usage = result.usage;
-  const rows = [];
-  if (usage) {
-    rows.push(["Input", formatNumber(usage.input_tokens)]);
-    const cached = usage.input_tokens_details && usage.input_tokens_details.cached_tokens;
-    if (typeof cached === "number") rows.push(["of which cached", formatNumber(cached)]);
-    rows.push(["Output", formatNumber(usage.output_tokens)]);
-    const reasoning = usage.output_tokens_details && usage.output_tokens_details.reasoning_tokens;
-    if (typeof reasoning === "number") rows.push(["of which reasoning", formatNumber(reasoning)]);
-    rows.push(["Total", formatNumber(usage.total_tokens)]);
-  }
-  setUsage(rows);
-
-  const lines = [];
-  lines.push("Model reported by the API: " + (result.model || "not reported") + ".");
-  if (result.status) lines.push("Status: " + result.status + ".");
-  if (!usage) lines.push("The response contained no usage information.");
-  lines.push("Only token counts are shown. Other charges, such as per-call tool fees, are not.");
-  usageExtra.textContent = lines.join(" ");
-}
-
-function renderResult(data) {
-  const result = parseResponse(data);
-  setResponse("", "");
-
-  if (result.error) {
-    responseBox.append(el("div", "notice", "OpenAI reported an error: " + hideKey(result.error, state.apiKey)));
-  }
-
-  const text = result.texts.join("\n\n").trim();
-  if (text) {
-    const md = el("div", "md");
-    renderMarkdown(text, md);
-    responseBox.append(md);
-  }
-  if (result.images.length) responseBox.append(renderImages(result.images));
-
-  if (!text && result.images.length === 0 && !result.error) {
-    responseBox.append(el("p", "", "The model returned no text or image."));
-    responseBox.classList.add("is-empty");
-  }
-
-  const sources = renderSources(result);
-  if (sources) responseBox.append(sources);
-  for (const note of result.notes) showNotice(note);
-  if (result.incomplete) showNotice("The response is incomplete (reason: " + result.incomplete + ").");
-
-  showUsage(result);
-}
-
-
-/* ==================================================================
-   12. RUN
-   ================================================================== */
-
-async function deleteUploads_(ids) {
-  const problems = [];
-  for (const id of ids) {
-    try {
-      await callApi("DELETE", "/files/" + id);
-    } catch (error) {
-      problems.push("Could not delete uploaded file " + id + ": " + explainError(error));
-    }
-  }
-  return problems;
+  if (!box.childNodes.length) { const p = document.createElement('div'); p.className = 'muted'; p.textContent = 'The response contained no output items. See the Response tab.'; box.appendChild(p); }
 }
 
 async function run() {
-  if (!state.initialized || state.busy > 0) return;
-
-  setBusy(true);
-  runButton.disabled = true;
-  runButton.textContent = "Running...";
-  setResponse("Waiting for the response...", "loading");
-  setUsage([]);
-  usageExtra.textContent = "";
-  const uploadedIds = [];
-  let cleanupProblems = [];
-
+  if (state.busy) { if (state.abort) state.abort.abort(); return; }
+  if (!state.ready) return;
+  const req = buildRequest();
+  if (req.problems.length) {
+    state.showProblems = true;
+    state.inspectorMode = 'preview';
+    renderRequestPane(req, 'Preview — what Run would send now');
+    renderComposerNote(req);
+    return;
+  }
+  cancelPreview();
+  const atts = state.attachments.slice();
+  state.showProblems = false;
+  state.busy = true;
+  state.abort = new AbortController();
+  refreshRunButton(); refreshUploadButton();
+  const turn = addTurn(req, atts);
+  const t0 = performance.now();
+  const timer = setInterval(() => { turn.pendEl.textContent = `Waiting for response… ${Math.round((performance.now() - t0) / 1000)} s`; }, 1000);
+  let finalRes = null;
   try {
-    const body = await buildRequestBody(uploadedIds);
-    requestJson.textContent = previewBody(body);
-    const data = await callApi("POST", "/responses", { json: body });
-    if (!data) throw new UserInputError("OpenAI sent an answer this page could not read.");
-    renderResult(data);
-  } catch (error) {
-    setResponse(explainError(error), "error");
+    const res = await api('POST', '/responses', { json: req.body, signal: state.abort.signal });
+    const ms = Math.round(performance.now() - t0);
+    const headers = []; res.res.headers.forEach((v, k) => headers.push(`${k}: ${v}`));
+    turn.response = { status: res.res.status, ms, data: res.data, text: res.text, headers };
+    finalRes = res.data;
+    try { renderOutput(turn, res.data, req); }
+    catch (re) { turn.body.innerHTML = `<div class="notice err">The response arrived but could not be displayed (${esc(re.message)}). Open the Response tab for the raw JSON.</div>`; }
+    metaLinks(turn, `${res.data.status || 'completed'} · ${(ms / 1000).toFixed(1)} s${res.data.id ? ' · ' + res.data.id : ''}`);
+    updateStats(res.data, req.body.model);
+    showTurnInspector(turn);
+    // the prompt and attachments were sent — clear the composer like a chat does (uploaded files stay listed for cleanup)
+    $('prompt').value = ''; autosize();
+    state.attachments = [];
+    renderAttachments('', true);
+    renderComposerNote(null);
+  } catch (e) {
+    const ms = Math.round(performance.now() - t0);
+    if (e && e.name === 'AbortError') {
+      turn.error = new ApiError({ kind: 'local', message: 'Request cancelled in the browser. OpenAI may still have processed it.' });
+      turn.body.innerHTML = '<div class="notice warn">Stopped. The request was cancelled in the browser; OpenAI may still have processed it.</div>';
+      metaLinks(turn, `cancelled · ${(ms / 1000).toFixed(1)} s`);
+    } else {
+      const ex = e instanceof ApiError ? e : networkError(e);
+      turn.error = ex;
+      turn.body.innerHTML = '';
+      const n = document.createElement('div'); n.className = 'notice err';
+      n.innerHTML = `<strong>${esc(ex.kind === 'network' ? 'Network error' : 'HTTP ' + ex.status + (ex.code ? ' · ' + ex.code : ''))}</strong><br>${esc(ex.message)}`;
+      if (ex.requestId) n.innerHTML += `<br><span class="muted small">Request ID: ${esc(ex.requestId)}</span>`;
+      turn.body.appendChild(n);
+      metaLinks(turn, `error · ${(ms / 1000).toFixed(1)} s`);
+      reportError(`Run · turn ${turn.n}`, ex);
+      showTurnInspector(turn);
+      setTab('errors');
+    }
   } finally {
-    if (uploadedIds.length && deleteUploads.checked) cleanupProblems = await deleteUploads_(uploadedIds);
-    for (const problem of cleanupProblems) showNotice(problem);
-    runButton.disabled = false;
-    runButton.textContent = "RUN";
-    setBusy(false);
+    clearInterval(timer);
+    state.busy = false; state.abort = null;
+    refreshRunButton(); refreshUploadButton();
+    if (finalRes === null && !turn.error) metaLinks(turn, 'no response');
+    scrollChat(true);
   }
 }
 
+/* ============================================================
+   11. Knowledge base (vector stores)
+   ============================================================ */
+function vsLog(msg) {
+  const log = $('vs-log');
+  log.textContent += `[${stamp()}] ${msg}\n`;
+  const lines = log.textContent.split('\n');
+  if (lines.length > 200) log.textContent = lines.slice(-200).join('\n');
+  log.scrollTop = log.scrollHeight;
+}
+function vsFail(what, e) {
+  const ex = e instanceof ApiError ? e : networkError(e);
+  vsLog(`${what} failed — ${errorLine(ex)}${ex.requestId ? ' (request ' + ex.requestId + ')' : ''}`);
+  reportError('Knowledge base', ex);
+}
 
-/* ==================================================================
-   13. Start
-   ================================================================== */
+async function loadVectorStores(selectId) {
+  vsLog('Listing vector stores…');
+  try {
+    const stores = []; let after = null;
+    for (let page = 0; page < 5; page++) {
+      const { data } = await api('GET', `/vector_stores?limit=100&order=desc${after ? '&after=' + encodeURIComponent(after) : ''}`);
+      stores.push(...(data.data || []));
+      if (!data.has_more || !data.last_id) break;
+      after = data.last_id;
+    }
+    state.vectorStores = stores;
+    const sel = $('vs-select');
+    const keep = selectId || sel.value;
+    sel.innerHTML = '<option value="">— none selected —</option>';
+    for (const s of stores) sel.add(new Option(`${s.name || '(unnamed)'} · ${s.id}`, s.id));
+    sel.value = stores.some((s) => s.id === keep) ? keep : '';
+    vsLog(`Found ${stores.length} vector store${stores.length === 1 ? '' : 's'}.`);
+    await loadVsFiles();
+  } catch (e) { vsFail('Listing vector stores', e); }
+  onControlChange();
+}
 
-initButton.addEventListener("click", init);
-keyInput.addEventListener("keydown", event => { if (event.key === "Enter") init(); });
-// Editing the key invalidates the INIT result, so the workspace locks again.
-keyInput.addEventListener("input", () => {
-  if (state.initialized) lockWorkspace("Locked. The key changed. Press INIT again.");
-});
+async function loadVsFiles() {
+  const id = $('vs-select').value;
+  const box = $('vs-files');
+  if (!id) { box.innerHTML = '<span class="muted small">No vector store selected.</span>'; return; }
+  box.innerHTML = '<span class="muted small">Loading…</span>';
+  try {
+    const { data } = await api('GET', `/vector_stores/${encodeURIComponent(id)}/files?limit=100`);
+    const files = data.data || [];
+    const names = await Promise.all(files.slice(0, 50).map(async (f) => {
+      try { const r = await api('GET', '/files/' + encodeURIComponent(f.id)); return r.data.filename || f.id; } catch (_) { return f.id; }
+    }));
+    box.innerHTML = '';
+    if (!files.length) { box.innerHTML = '<span class="muted small">This vector store has no files.</span>'; return; }
+    files.forEach((f, i) => {
+      const row = document.createElement('div'); row.className = 'vs-file';
+      const name = document.createElement('span'); name.className = 'name'; name.textContent = names[i] || f.id; name.title = f.id;
+      const st = document.createElement('span'); st.className = 'muted'; st.textContent = f.status + (f.last_error ? ' — ' + f.last_error.message : '');
+      row.append(name, st); box.appendChild(row);
+    });
+    if (data.has_more) box.insertAdjacentHTML('beforeend', '<span class="muted small">Showing the first 100 files.</span>');
+  } catch (e) { box.innerHTML = '<span class="muted small">Could not load files. See the log.</span>'; vsFail('Listing vector store files', e); }
+}
 
-modelSelect.addEventListener("change", applyModelRules);
-showAllModels.addEventListener("change", fillModelSelect);
+async function createVectorStore() {
+  const name = $('vs-name').value.trim();
+  if (!name) { vsLog('Enter a name for the new vector store.'); return; }
+  vsLog(`Creating vector store "${name}"…`);
+  try {
+    const { data } = await api('POST', '/vector_stores', { json: { name } });
+    vsLog(`Created ${data.id}.`);
+    $('vs-name').value = '';
+    await loadVectorStores(data.id);
+  } catch (e) { vsFail('Creating vector store', e); }
+}
 
-$("add-images").addEventListener("click", () => imageInput.click());
-$("add-docs").addEventListener("click", () => docInput.click());
-imageInput.addEventListener("change", () => {
-  addFiles(imageInput.files, state.images, MAX_IMAGE_BYTES, ["image/png", "image/jpeg", "image/webp", "image/gif"]);
-  imageInput.value = "";
-});
-docInput.addEventListener("change", () => {
-  addFiles(docInput.files, state.docs, MAX_FILE_BYTES, null);
-  docInput.value = "";
-});
+async function uploadToVectorStore(files) {
+  const vs = $('vs-select').value;
+  if (!vs) { vsLog('Select a vector store before uploading.'); $('vs-upload').value = ''; return; }
+  for (const f of files) {
+    try {
+      vsLog(`Uploading ${f.name} (${fmtBytes(f.size)})…`);
+      const form = new FormData();
+      form.append('purpose', 'assistants');
+      form.append('file', f, f.name);
+      const up = await api('POST', '/files', { form });
+      vsLog(`Uploaded as ${up.data.id}. Adding to ${vs}…`);
+      const link = await api('POST', `/vector_stores/${encodeURIComponent(vs)}/files`, { json: { file_id: up.data.id } });
+      let status = link.data.status;
+      for (let i = 0; i < 40 && status === 'in_progress'; i++) {
+        await sleep(1500);
+        const { data } = await api('GET', `/vector_stores/${encodeURIComponent(vs)}/files/${encodeURIComponent(up.data.id)}`);
+        status = data.status;
+        if (data.last_error) vsLog(`${f.name}: ${data.last_error.code} — ${data.last_error.message}`);
+      }
+      vsLog(`${f.name}: ${status}.`);
+    } catch (e) { vsFail(`Uploading ${f.name}`, e); }
+  }
+  $('vs-upload').value = '';
+  await loadVsFiles();
+}
 
-toolWeb.addEventListener("change", () => { webOpts.hidden = !toolWeb.checked; });
-toolFiles.addEventListener("change", () => {
-  filesOpts.hidden = !toolFiles.checked;
-  if (toolFiles.checked && !state.vectorStoresLoaded) loadVectorStores();
-});
-toolImage.addEventListener("change", () => { imageOpts.hidden = !toolImage.checked; });
-$("vs-refresh").addEventListener("click", () => loadVectorStores(selectedStoreIds()));
-$("vs-create").addEventListener("click", createVectorStore);
-$("vs-upload").addEventListener("click", uploadToVectorStore);
-imgModel.addEventListener("change", fillImageQuality);
-imgFormat.addEventListener("change", updateImageCompression);
+/* ============================================================
+   12. Layout + wiring
+   ============================================================ */
+const MIN_PANEL = 280, MAX_PANEL = 520, MIN_MAIN = 380;
+function setPanelWidth(w) {
+  const max = Math.max(MIN_PANEL, Math.min(MAX_PANEL, window.innerWidth - MIN_MAIN));
+  w = Math.max(MIN_PANEL, Math.min(max, Math.round(w)));
+  document.documentElement.style.setProperty('--panel-w', w + 'px');
+  const r = $('resizer');
+  r.setAttribute('aria-valuenow', String(w)); r.setAttribute('aria-valuemin', String(MIN_PANEL)); r.setAttribute('aria-valuemax', String(max));
+  return w;
+}
+function initResizer() {
+  const r = $('resizer');
+  let dragging = false;
+  r.addEventListener('pointerdown', (e) => { dragging = true; r.setPointerCapture && r.setPointerCapture(e.pointerId); document.body.classList.add('resizing'); e.preventDefault(); });
+  r.addEventListener('pointermove', (e) => { if (dragging) setPanelWidth(e.clientX - $('app').getBoundingClientRect().left); });
+  const stop = () => { dragging = false; document.body.classList.remove('resizing'); };
+  r.addEventListener('pointerup', stop); r.addEventListener('pointercancel', stop);
+  r.addEventListener('keydown', (e) => {
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    const cur = $('panel').getBoundingClientRect().width;
+    setPanelWidth(cur + (e.key === 'ArrowRight' ? 16 : -16));
+    e.preventDefault();
+  });
+  window.addEventListener('resize', () => { if (window.innerWidth > 900) setPanelWidth($('panel').getBoundingClientRect().width); });
+}
+function openPanel() { document.body.classList.add('panel-open'); }
+function closePanel() { document.body.classList.remove('panel-open'); }
 
-runButton.addEventListener("click", run);
+function autosize() {
+  const p = $('prompt');
+  p.style.height = 'auto';
+  p.style.height = Math.min(p.scrollHeight, 220) + 'px';
+}
 
-lockWorkspace("Locked. Enter your OpenAI API key and press INIT.");
+let previewTimer = null;
+function cancelPreview() { clearTimeout(previewTimer); previewTimer = null; }
+function onControlChange() {
+  cancelPreview();
+  previewTimer = setTimeout(() => { state.inspectorMode = 'preview'; renderPreview(); }, 120);
+}
+
+function wire() {
+  // connection
+  $('init').addEventListener('click', init);
+  $('api-key').addEventListener('keydown', (e) => { if (e.key === 'Enter') init(); });
+  $('api-key').addEventListener('input', () => {
+    if (state.ready && $('api-key').value.trim() !== state.key) {
+      state.ready = false; state.key = '';
+      setLocked(true);
+      setStatus($('init-status'), '', 'Key changed. Press INIT to connect again.');
+    }
+  });
+
+  // models
+  $('model-search').addEventListener('input', renderModels);
+  $('show-all-models').addEventListener('change', renderModels);
+  $('model').addEventListener('change', () => { applyCaps(); onControlChange(); });
+  $('cap-override').addEventListener('change', () => { applyCaps(); onControlChange(); });
+  $('reasoning').addEventListener('change', () => { applyCaps(); onControlChange(); });
+  bindSlider('temperature'); bindSlider('top-p');
+
+  // tools + any other input in the panel or composer refreshes the live request preview
+  for (const id of ['tool-web', 'tool-files', 'tool-image', 'img-format']) $(id).addEventListener('change', syncToolPanels);
+  $('workspace').addEventListener('input', onControlChange);
+  $('workspace').addEventListener('change', onControlChange);
+  $('prompt').addEventListener('input', () => { autosize(); onControlChange(); });
+
+  // composer
+  $('prompt').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); run(); }
+  });
+  $('run').addEventListener('click', run);
+  $('add-images').addEventListener('click', () => $('image-input').click());
+  $('add-docs').addEventListener('click', () => $('doc-input').click());
+  $('image-input').addEventListener('change', (e) => { const f = [...e.target.files]; e.target.value = ''; addImages(f); });
+  $('doc-input').addEventListener('change', (e) => { const f = [...e.target.files]; e.target.value = ''; addDocs(f); });
+  $('attachments').addEventListener('click', (e) => { const b = e.target.closest('[data-remove]'); if (b) removeAttachment(b.dataset.remove); });
+  $('delete-uploads').addEventListener('click', () => deleteRemoteFiles(state.uploaded.map((u) => u.id)));
+
+  // chat
+  $('response').addEventListener('click', (e) => {
+    const code = e.target.closest('[data-copy-code]');
+    if (code) { flashCopy(code, code.closest('.code').querySelector('code').textContent); return; }
+    const ins = e.target.closest('[data-inspect]');
+    if (ins) { const t = state.turns[+ins.dataset.inspect - 1]; if (t) { showTurnInspector(t); setTab(t.error ? 'errors' : 'response'); } return; }
+    const cp = e.target.closest('[data-copy-answer]');
+    if (cp) { const t = state.turns[+cp.dataset.copyAnswer - 1]; if (t && t.response) flashCopy(cp, textOf(t.response.data)); }
+  });
+  $('clear-chat').addEventListener('click', () => {
+    if (state.busy) return;
+    state.turns = []; state.selected = null;
+    $('response').innerHTML = '<div class="empty" id="empty-state"><p class="empty-title">◉ OpenAI API Desk</p><p>Conversation cleared. Each Run is an independent request.</p></div>';
+    updateStats();
+  });
+
+  // inspector
+  for (const t of document.querySelectorAll('.tab')) t.addEventListener('click', () => setTab(t.dataset.tab));
+  $('inspector-toggle').addEventListener('click', () => setInspectorOpen($('inspector-body').hidden));
+  $('copy-request').addEventListener('click', (e) => { if (state.lastRequest) flashCopy(e.currentTarget, JSON.stringify(state.lastRequest.body, null, 2)); });
+  $('copy-curl').addEventListener('click', (e) => { if (state.lastRequest) flashCopy(e.currentTarget, curlText(state.lastRequest)); });
+  const selTurn = () => state.turns[(state.selected || 0) - 1];
+  $('copy-response').addEventListener('click', (e) => { const t = selTurn(); if (t && t.response) flashCopy(e.currentTarget, JSON.stringify(t.response.data, null, 2)); });
+  $('download-response').addEventListener('click', () => { const t = selTurn(); if (t && t.response) downloadFile(`response-${t.response.data.id || 'turn-' + t.n}.json`, JSON.stringify(t.response.data, null, 2)); });
+
+  // knowledge base
+  $('vs-refresh').addEventListener('click', () => loadVectorStores());
+  $('vs-select').addEventListener('change', () => { loadVsFiles(); onControlChange(); });
+  $('vs-create').addEventListener('click', createVectorStore);
+  $('vs-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') createVectorStore(); });
+  $('vs-upload').addEventListener('change', (e) => uploadToVectorStore([...e.target.files]));
+
+  // panel drawer on narrow screens
+  $('panel-toggle').addEventListener('click', openPanel);
+  $('panel-close').addEventListener('click', closePanel);
+  $('scrim').addEventListener('click', closePanel);
+}
+
+function boot() {
+  for (const pre of document.querySelectorAll('pre[data-lang]')) pre.innerHTML = Highlight(pre.textContent, pre.dataset.lang);
+  setPanelWidth($('panel').getBoundingClientRect().width || 380);
+  initResizer();
+  wire();
+  setLocked(true);
+  applyCaps();
+  renderPreview();
+  if (window.matchMedia('(max-width: 900px)').matches) openPanel();
+}
+boot();
+})();

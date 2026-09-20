@@ -1,547 +1,410 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>OpenAI API Desk</title>
-  <link rel="stylesheet" href="styles.css">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- The key can only ever be sent to api.openai.com: nothing else is allowed to connect. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src https://api.openai.com; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>OpenAI API Desk</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="styles.css">
 </head>
 <body>
+<div class="app" id="app">
 
-  <main class="layout">
+  <!-- ============ Left: control panel ============ -->
+  <aside class="panel" id="panel" aria-label="API configuration">
+    <div class="panel-head">
+      <span class="brand"><span class="brand-mark" aria-hidden="true">◉</span> OpenAI API Desk</span>
+      <button type="button" class="icon-btn only-narrow" id="panel-close" aria-label="Close panel">✕</button>
+    </div>
 
-    <!-- =========================================================
-         LEFT: CONTROL PANEL
-         ========================================================= -->
-    <aside class="panel sidebar" aria-label="OpenAI API Desk controls">
+    <div class="panel-scroll">
 
-      <header class="topbar">
-        <h1>? OpenAI API Desk</h1>
-        <span class="topbar-note">
-          Unofficial client for the OpenAI API. Runs in your browser.
-          No account, no backend.
-        </span>
-      </header>
-
-      <!-- API connection -->
-      <div class="connect">
-        <label for="api-key">API key</label>
-
-        <div class="row">
-          <input
-            id="api-key"
-            type="password"
-            autocomplete="off"
-            spellcheck="false"
-            placeholder="sk-..."
-          >
-          <button id="init" type="button" class="init">INIT</button>
+      <details class="section" open>
+        <summary>Connection</summary>
+        <div class="section-body">
+          <div class="field">
+            <label class="label" for="api-key">API key</label>
+            <div class="row">
+              <input class="input mono" type="password" id="api-key" autocomplete="new-password" spellcheck="false" placeholder="sk-…">
+              <button type="button" class="btn primary" id="init">INIT</button>
+            </div>
+            <p class="status" id="init-status" role="status">Not connected. Enter your key and press INIT.</p>
+          </div>
         </div>
+      </details>
 
-        <p id="init-status" class="status" role="status">
-          Locked. Enter your OpenAI API key and press INIT.
-        </p>
-      </div>
+      <fieldset id="workspace" class="workspace" disabled>
 
-      <fieldset id="workspace" disabled>
-        <legend class="sr-only">Workspace</legend>
-
-        <div class="stack">
-
-          <!-- =====================================================
-               MODEL
-               ===================================================== -->
-          <section class="group" aria-labelledby="h-model">
-            <h2 id="h-model">Model</h2>
-
-            <select id="model" aria-label="Model"></select>
-
-            <label class="check">
-              <input type="checkbox" id="show-all-models">
-              Show every model ID the API returned
-            </label>
-
-            <p id="model-count" class="hint"></p>
-          </section>
-
-
-          <!-- =====================================================
-               PARAMETERS
-               ===================================================== -->
-          <section class="group" aria-labelledby="h-params">
-            <h2 id="h-params">Parameters</h2>
-
-            <div class="params">
-
-              <div class="param">
-                <label for="max-output">Max output tokens</label>
-                <input
-                  id="max-output"
-                  type="number"
-                  min="16"
-                  step="1"
-                  placeholder="model default"
-                >
-                <p class="hint">
-                  Counts reasoning tokens too. Minimum 16.
-                </p>
+        <details class="section" open>
+          <summary>Model</summary>
+          <div class="section-body">
+            <div class="field">
+              <input class="input" type="search" id="model-search" placeholder="Search models" aria-label="Search models">
+            </div>
+            <div class="field">
+              <label class="label" for="model">Model</label>
+              <select class="select" id="model"><option value="">— choose a model —</option></select>
+              <div class="row between">
+                <label class="check"><input type="checkbox" id="show-all-models"> Show all models</label>
+                <span class="muted small" id="model-count">0 models</span>
               </div>
+              <label class="check"><input type="checkbox" id="cap-override"> Ignore inferred limits (send as configured)</label>
+              <p class="hint" id="capability-note">Choose a model to see which options it accepts.</p>
+            </div>
+          </div>
+        </details>
 
-              <div class="param">
-                <label for="reasoning">Reasoning effort</label>
-                <select id="reasoning"></select>
-                <p id="reasoning-hint" class="hint"></p>
-              </div>
+        <details class="section" open>
+          <summary>Instructions</summary>
+          <div class="section-body">
+            <div class="field">
+              <label class="label" for="instructions">Instructions</label>
+              <textarea class="textarea mono" id="instructions" rows="6" spellcheck="false" placeholder="You are a concise assistant…"></textarea>
+              <p class="hint">Instructions sent to the model as developer instructions.</p>
+            </div>
+          </div>
+        </details>
 
-              <div class="param">
-                <label for="temperature">Temperature</label>
-                <input
-                  id="temperature"
-                  type="number"
-                  min="0"
-                  max="2"
-                  step="0.1"
-                  placeholder="model default"
-                >
-                <p id="temperature-hint" class="hint"></p>
-              </div>
+        <details class="section" open>
+          <summary>Request parameters</summary>
+          <div class="section-body">
 
-              <div class="param">
-                <label for="top-p">Top P</label>
-                <input
-                  id="top-p"
-                  type="number"
-                  min="0"
-                  max="1"
-                  step="0.05"
-                  placeholder="model default"
-                >
-                <p id="top-p-hint" class="hint"></p>
-              </div>
-
+            <div class="field">
+              <label class="label" for="max-output">Max output tokens</label>
+              <input class="input" type="number" id="max-output" min="16" step="1" placeholder="Not sent">
+              <p class="hint" id="max-output-hint">Maximum number of tokens the model may generate.</p>
             </div>
 
-            <p id="capability-note" class="hint"></p>
-          </section>
+            <div class="field">
+              <label class="label" for="reasoning">Reasoning</label>
+              <select class="select" id="reasoning"><option value="">Default (not sent)</option></select>
+              <p class="hint" id="reasoning-hint">Reasoning effort.</p>
+              <div class="row">
+                <div class="grow">
+                  <label class="label small" for="reasoning-summary">Summary</label>
+                  <select class="select" id="reasoning-summary">
+                    <option value="">Not sent</option>
+                    <option value="auto">auto</option>
+                    <option value="concise">concise</option>
+                    <option value="detailed">detailed</option>
+                  </select>
+                </div>
+                <div class="grow" id="reasoning-mode-wrap" hidden>
+                  <label class="label small" for="reasoning-mode">Mode</label>
+                  <select class="select" id="reasoning-mode">
+                    <option value="">Not sent (standard)</option>
+                    <option value="standard">standard</option>
+                    <option value="pro">pro</option>
+                  </select>
+                </div>
+              </div>
+            </div>
 
+            <div class="field">
+              <label class="label" for="temperature">Temperature</label>
+              <div class="row">
+                <input class="range" type="range" id="temperature" min="0" max="2" step="0.05" value="1">
+                <input class="input num" type="number" id="temperature-num" min="0" max="2" step="0.05" placeholder="—" aria-label="Temperature value">
+                <button type="button" class="btn ghost" id="temperature-clear" title="Do not send temperature">Clear</button>
+              </div>
+              <p class="hint" id="temperature-hint">Higher values generally make output more random; lower values make it more focused.</p>
+            </div>
 
-          <!-- =====================================================
-               SYSTEM PROMPT
-               ===================================================== -->
-          <section class="group" aria-labelledby="h-instructions">
-            <h2 id="h-instructions">System Prompt</h2>
+            <div class="field">
+              <label class="label" for="top-p">Top P</label>
+              <div class="row">
+                <input class="range" type="range" id="top-p" min="0" max="1" step="0.01" value="1">
+                <input class="input num" type="number" id="top-p-num" min="0" max="1" step="0.01" placeholder="—" aria-label="Top P value">
+                <button type="button" class="btn ghost" id="top-p-clear" title="Do not send top_p">Clear</button>
+              </div>
+              <p class="hint" id="top-p-hint">Nucleus sampling. Controls the probability mass considered during token selection.</p>
+              <p class="hint">Usually adjust either Temperature or Top P, rather than both.</p>
+            </div>
 
-            <label for="instructions">
-              Instructions (optional)
-            </label>
+          </div>
+        </details>
 
-            <textarea
-              id="instructions"
-              rows="5"
-              placeholder="Standing instructions for the model"
-            ></textarea>
-          </section>
+        <details class="section" open>
+          <summary>Tools</summary>
+          <div class="section-body">
 
-
-          <!-- =====================================================
-               TOOLS
-               ===================================================== -->
-          <section class="group" aria-labelledby="h-tools">
-            <h2 id="h-tools">Tools</h2>
-
-            <p class="hint">
-              Off by default. A tool is sent only when ticked.
-              Whether a tool works depends on the model.
-            </p>
-
-
-            <!-- Web search -->
             <div class="tool">
-
-              <label class="check">
-                <input type="checkbox" id="tool-web">
-                Web search
-              </label>
-
+              <label class="check strong"><input type="checkbox" id="tool-web"> Web search</label>
+              <p class="hint why" data-why="web" hidden></p>
               <div class="tool-opts" id="web-opts" hidden>
-
-                <label for="web-context">
-                  Search context size
-                </label>
-
-                <select id="web-context">
-                  <option value="">Default</option>
+                <label class="label small" for="web-context">Search context size</label>
+                <select class="select" id="web-context">
+                  <option value="">Default (not sent)</option>
                   <option value="low">low</option>
                   <option value="medium">medium</option>
                   <option value="high">high</option>
                 </select>
-
+                <div class="row">
+                  <div class="grow"><label class="label small" for="web-country">Country</label><input class="input" id="web-country" maxlength="2" placeholder="US"></div>
+                  <div class="grow"><label class="label small" for="web-city">City</label><input class="input" id="web-city" placeholder="Not sent"></div>
+                </div>
+                <label class="label small" for="web-region">Region</label>
+                <input class="input" id="web-region" placeholder="Not sent">
+                <label class="label small" for="web-domains">Allowed domains (comma separated)</label>
+                <input class="input mono" id="web-domains" placeholder="openai.com, developers.openai.com">
+                <p class="hint">Location and domain filters are sent inside the web_search tool. Empty fields are omitted.</p>
               </div>
-
             </div>
 
-
-            <!-- File search -->
             <div class="tool">
-
-              <label class="check">
-                <input type="checkbox" id="tool-files">
-                File Search (document collection / Vector Store)
-              </label>
-
+              <label class="check strong"><input type="checkbox" id="tool-files"> File search</label>
+              <p class="hint why" data-why="files" hidden></p>
               <div class="tool-opts" id="files-opts" hidden>
-
-                <p class="hint">
-                  Searches documents you stored earlier in a vector store.
-                  Different from attaching a file above.
-                </p>
-
-                <label for="vs-select">
-                  Vector stores to search
-                </label>
-
-                <select id="vs-select" multiple size="4"></select>
-
-                <div class="row">
-                  <button type="button" id="vs-refresh">
-                    Refresh list
-                  </button>
-                </div>
-
-                <label for="vs-name">
-                  New vector store
-                </label>
-
-                <div class="row">
-                  <input
-                    id="vs-name"
-                    type="text"
-                    placeholder="Name"
-                  >
-                  <button type="button" id="vs-create">
-                    Create
-                  </button>
-                </div>
-
-                <label for="vs-files">
-                  Add documents to the selected store
-                </label>
-
-                <div class="row">
-                  <input
-                    id="vs-files"
-                    type="file"
-                    multiple
-                  >
-                  <button type="button" id="vs-upload">
-                    Upload
-                  </button>
-                </div>
-
-                <ul
-                  id="vs-log"
-                  class="log"
-                  aria-live="polite"
-                ></ul>
-
+                <p class="hint">Searches the vector store selected under Knowledge base.</p>
+                <label class="label small" for="fs-max">Max results</label>
+                <input class="input" type="number" id="fs-max" min="1" max="50" step="1" placeholder="Not sent">
+                <label class="check"><input type="checkbox" id="fs-results"> Include search results in the response</label>
               </div>
-
             </div>
 
-
-            <!-- Image generation -->
             <div class="tool">
-
-              <label class="check">
-                <input type="checkbox" id="tool-image">
-                Image generation
-              </label>
-
-              <div class="tool-opts" id="image-opts" hidden>
-
-                <div class="params">
-
-                  <div class="param">
-                    <label for="img-model">Image model</label>
-                    <select id="img-model"></select>
-                  </div>
-
-                  <div class="param">
-                    <label for="img-size">Size</label>
-
-                    <select id="img-size">
-                      <option value="">Default</option>
-                      <option value="auto">auto</option>
-                      <option value="1024x1024">1024x1024</option>
-                      <option value="1536x1024">1536x1024</option>
-                      <option value="1024x1536">1024x1536</option>
-                    </select>
-                  </div>
-
-                  <div class="param">
-                    <label for="img-quality">Quality</label>
-                    <select id="img-quality"></select>
-                  </div>
-
-                  <div class="param">
-                    <label for="img-format">Format</label>
-
-                    <select id="img-format">
-                      <option value="">Default</option>
-                      <option value="png">png</option>
-                      <option value="webp">webp</option>
-                      <option value="jpeg">jpeg</option>
-                    </select>
-                  </div>
-
-                  <div class="param">
-                    <label for="img-compression">
-                      Compression (0-100)
-                    </label>
-
-                    <input
-                      id="img-compression"
-                      type="number"
-                      min="0"
-                      max="100"
-                      step="1"
-                      placeholder="default"
-                      disabled
-                    >
-
-                    <p class="hint">
-                      Only for jpeg and webp.
-                    </p>
-                  </div>
-
-                  <div class="param">
-                    <label for="img-background">
-                      Background
-                    </label>
-
-                    <select id="img-background">
-                      <option value="">Default</option>
-                      <option value="auto">auto</option>
-                      <option value="opaque">opaque</option>
-                      <option value="transparent">transparent</option>
-                    </select>
-
-                    <p class="hint">
-                      Transparent needs png or webp.
-                    </p>
-                  </div>
-
-                  <div class="param">
-                    <label for="img-moderation">
-                      Moderation
-                    </label>
-
-                    <select id="img-moderation">
-                      <option value="">Default</option>
-                      <option value="auto">auto</option>
-                      <option value="low">low</option>
-                    </select>
-                  </div>
-
-                </div>
-
-                <label class="check">
-                  <input
-                    type="checkbox"
-                    id="img-force"
-                    checked
-                  >
-                  Always generate an image
-                </label>
-
-                <p class="hint">
-                  Forces the tool, so no other tool is used in this request.
-                  Untick to let the model decide.
-                </p>
-
-              </div>
-
+              <label class="check strong"><input type="checkbox" id="tool-code"> Code interpreter</label>
+              <p class="hint why" data-why="code" hidden></p>
+              <p class="hint">Runs Python in an OpenAI-hosted container (container type: auto).</p>
             </div>
 
-          </section>
+            <div class="tool">
+              <label class="check strong"><input type="checkbox" id="tool-image"> Image generation</label>
+              <p class="hint why" data-why="image" hidden></p>
+              <div class="tool-opts" id="image-opts" hidden>
+                <label class="label small" for="img-model">Image model</label>
+                <input class="input mono" id="img-model" list="img-model-list" placeholder="Default (not sent)">
+                <datalist id="img-model-list"></datalist>
+                <div class="row">
+                  <div class="grow">
+                    <label class="label small" for="img-size">Size</label>
+                    <input class="input mono" id="img-size" list="img-size-list" placeholder="Default (not sent)">
+                    <datalist id="img-size-list"><option value="auto"><option value="1024x1024"><option value="1024x1536"><option value="1536x1024"></datalist>
+                  </div>
+                  <div class="grow">
+                    <label class="label small" for="img-quality">Quality</label>
+                    <select class="select" id="img-quality">
+                      <option value="">Default (not sent)</option>
+                      <option value="auto">auto</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="max">max</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="row">
+                  <div class="grow">
+                    <label class="label small" for="img-format">Format</label>
+                    <select class="select" id="img-format">
+                      <option value="">Default (not sent)</option>
+                      <option value="png">png</option><option value="jpeg">jpeg</option><option value="webp">webp</option>
+                    </select>
+                  </div>
+                  <div class="grow">
+                    <label class="label small" for="img-compression">Compression (0–100)</label>
+                    <input class="input" type="number" id="img-compression" min="0" max="100" step="1" placeholder="Not sent" disabled>
+                  </div>
+                </div>
+                <div class="row">
+                  <div class="grow">
+                    <label class="label small" for="img-background">Background</label>
+                    <select class="select" id="img-background">
+                      <option value="">Default (not sent)</option>
+                      <option value="auto">auto</option><option value="opaque">opaque</option><option value="transparent">transparent</option>
+                    </select>
+                  </div>
+                  <div class="grow">
+                    <label class="label small" for="img-moderation">Moderation</label>
+                    <select class="select" id="img-moderation">
+                      <option value="">Default (not sent)</option>
+                      <option value="auto">auto</option><option value="low">low</option>
+                    </select>
+                  </div>
+                </div>
+                <label class="check"><input type="checkbox" id="img-force"> Force this tool (tool_choice)</label>
+                <p class="hint">Accepted values depend on the image model. Empty fields are omitted; the API reports invalid combinations.</p>
+              </div>
+            </div>
 
-        </div>
-      </fieldset>
-
-
-      <!-- Privacy note stays at the bottom of the left panel -->
-      <p class="privacy">
-        Your API key stays in this page's memory. It is sent only to
-        api.openai.com, and it is forgotten when you close or reload the page.
-        Editing the key locks the workspace again.
-      </p>
-
-    </aside>
-
-
-    <!-- =========================================================
-         RIGHT: CHAT WORKSPACE
-         ========================================================= -->
-    <section
-      class="panel chat-workspace"
-      aria-label="Chat Workspace"
-    >
-
-      <!-- =======================================================
-           TOKEN / MODEL STATUS
-           ======================================================= -->
-      <div class="usage">
-
-        <h2>USAGE</h2>
-
-        <dl id="usage-list" class="usage-numbers"></dl>
-
-        <p id="usage-extra" class="usage-extra"></p>
-
-      </div>
-
-
-      <!-- =======================================================
-           RESPONSE / CHAT HISTORY
-           ======================================================= -->
-      <div class="response-area">
-
-        <div class="result-body">
-
-          <h2>RESPONSE</h2>
-
-          <div
-            id="response"
-            class="response is-empty"
-            aria-live="polite"
-          >
-            The response will appear here.
           </div>
-
-        </div>
-
-        <!-- Request sent -->
-        <details class="request-preview">
-
-          <summary>Request sent</summary>
-
-          <pre id="request-json">Nothing sent yet.</pre>
-
         </details>
 
-      </div>
-
-
-      <!-- =======================================================
-           CHAT COMPOSER
-           ======================================================= -->
-      <div class="input-area">
-
-        <!-- User prompt -->
-        <section
-          class="group prompt-group"
-          aria-labelledby="h-prompt"
-        >
-
-          <h2 id="h-prompt">Prompt</h2>
-
-          <label for="prompt">Message</label>
-
-          <textarea
-            id="prompt"
-            rows="5"
-            placeholder="Write your request here"
-          ></textarea>
-
-        </section>
-
-
-        <!-- Attachments -->
-        <section
-          class="group attachment-group"
-          aria-labelledby="h-attach"
-        >
-
-          <h2 id="h-attach">Attachments</h2>
-
-          <p class="hint">
-            Sent with this one request. Images go inline.
-            Documents are uploaded to your OpenAI Files storage first.
-          </p>
-
-          <div class="row">
-
-            <button
-              type="button"
-              id="add-images"
-            >
-              Add images
-            </button>
-
-            <button
-              type="button"
-              id="add-docs"
-            >
-              Add documents
-            </button>
-
-            <input
-              type="file"
-              id="image-input"
-              accept="image/png,image/jpeg,image/webp,image/gif"
-              multiple
-              hidden
-            >
-
-            <input
-              type="file"
-              id="doc-input"
-              multiple
-              hidden
-            >
-
+        <details class="section">
+          <summary>Knowledge base</summary>
+          <div class="section-body">
+            <p class="hint">Vector stores hold persistent, searchable files for File search. They are separate from the temporary attachments next to the prompt.</p>
+            <div class="field">
+              <label class="label" for="vs-select">Vector store</label>
+              <div class="row">
+                <select class="select" id="vs-select"><option value="">— none selected —</option></select>
+                <button type="button" class="btn" id="vs-refresh">Refresh</button>
+              </div>
+            </div>
+            <div class="field">
+              <label class="label" for="vs-name">New vector store name</label>
+              <div class="row">
+                <input class="input" id="vs-name" placeholder="my-knowledge-base">
+                <button type="button" class="btn" id="vs-create">Create</button>
+              </div>
+            </div>
+            <div class="field">
+              <span class="label">Files in the selected store</span>
+              <div class="vs-files" id="vs-files"><span class="muted small">No vector store selected.</span></div>
+            </div>
+            <div class="field">
+              <label class="label" for="vs-upload">Upload to the selected store</label>
+              <input class="file" type="file" id="vs-upload" multiple>
+              <p class="hint">Files are uploaded to your OpenAI account and stay until you delete them.</p>
+            </div>
+            <div class="field">
+              <span class="label">Operation log</span>
+              <pre class="log" id="vs-log" aria-live="polite"></pre>
+            </div>
           </div>
+        </details>
 
-          <ul
-            id="attachments"
-            class="chips"
-          ></ul>
+        <details class="section">
+          <summary>Privacy</summary>
+          <div class="section-body">
+            <ul class="plain">
+              <li>Your API key is typed here and kept only in this page's memory. Reloading clears it.</li>
+              <li>The browser talks directly to api.openai.com. There is no backend, account, or analytics.</li>
+              <li>The key is always masked in request previews.</li>
+              <li>Images are sent inline with the request. Documents are uploaded to your OpenAI account and referenced by file ID; Delete uploads removes them.</li>
+              <li>OpenAI stores Responses by default. This app does not change that setting.</li>
+            </ul>
+          </div>
+        </details>
 
-          <p
-            id="attach-status"
-            class="hint"
-            role="status"
-          ></p>
+        <details class="section">
+          <summary>API examples</summary>
+          <div class="section-body">
+            <p class="hint">Educational only. The Request tab always shows what this app actually sends.</p>
+            <p class="label small">Basic request</p>
+<pre class="pre example" data-lang="json">{
+  "model": "gpt-5.6-luna",
+  "input": "Explain quantum computing simply."
+}</pre>
+            <p class="label small">With instructions</p>
+<pre class="pre example" data-lang="json">{
+  "model": "gpt-5.6-luna",
+  "instructions": "Answer concisely.",
+  "input": "Explain quantum computing."
+}</pre>
+            <p class="label small">With reasoning</p>
+<pre class="pre example" data-lang="json">{
+  "model": "gpt-5.6-luna",
+  "reasoning": {
+    "effort": "medium"
+  },
+  "input": "Solve this problem."
+}</pre>
+            <p class="label small">With a hosted tool</p>
+<pre class="pre example" data-lang="json">{
+  "model": "gpt-5.6-luna",
+  "input": "What changed in the latest release?",
+  "tools": [{ "type": "web_search" }]
+}</pre>
+          </div>
+        </details>
 
-          <label class="check">
-            <input
-              type="checkbox"
-              id="delete-uploads"
-              checked
-            >
-            Delete uploaded documents from OpenAI after RUN
-          </label>
+      </fieldset>
+    </div>
+  </aside>
 
-        </section>
+  <div class="resizer" id="resizer" role="separator" aria-orientation="vertical" aria-label="Resize control panel" tabindex="0"></div>
+  <div class="scrim" id="scrim"></div>
 
+  <!-- ============ Right: chat ============ -->
+  <main class="main">
 
-        <!-- RUN -->
-        <button
-          id="run"
-          type="button"
-          class="run"
-        >
-          RUN
-        </button>
+    <header class="statusbar">
+      <button type="button" class="icon-btn only-narrow" id="panel-toggle" aria-label="Open control panel">☰</button>
+      <div class="stats" id="usage-list">
+        <span class="stat-model mono" data-stat="model">—</span>
+        <span><b data-stat="input">—</b> input</span>
+        <span><b data-stat="output">—</b> output</span>
+        <span><b data-stat="total">—</b> total</span>
+        <span class="muted" id="usage-extra"></span>
+      </div>
+      <button type="button" class="btn ghost" id="clear-chat">Clear</button>
+    </header>
 
+    <div class="chat-scroll" id="chat-scroll">
+      <div class="chat-inner" id="response" aria-live="polite">
+        <div class="empty" id="empty-state">
+          <p class="empty-title">◉ OpenAI API Desk</p>
+          <p>Initialize with your API key, choose a model, and run a prompt. Every request and response can be inspected below.</p>
+        </div>
+      </div>
+    </div>
+
+    <section class="inspector" id="inspector" aria-label="Request and response inspector">
+      <div class="inspector-bar">
+        <div class="tabs" role="tablist">
+          <button type="button" role="tab" class="tab" data-tab="request" aria-selected="true">Request</button>
+          <button type="button" role="tab" class="tab" data-tab="response" aria-selected="false">Response</button>
+          <button type="button" role="tab" class="tab" data-tab="usage" aria-selected="false">Usage</button>
+          <button type="button" role="tab" class="tab" data-tab="errors" aria-selected="false">Errors<span class="badge" id="err-badge" hidden>!</span></button>
+        </div>
+        <span class="muted small grow ellipsis" id="inspector-label"></span>
+        <button type="button" class="icon-btn" id="inspector-toggle" aria-expanded="false" aria-label="Expand inspector">▴</button>
       </div>
 
+      <div class="inspector-body" id="inspector-body" hidden>
+        <div class="pane" data-pane="request">
+          <div class="pane-actions">
+            <button type="button" class="btn" id="copy-request">Copy JSON</button>
+            <button type="button" class="btn" id="copy-curl">Copy cURL</button>
+          </div>
+          <div id="request-problems"></div>
+          <pre class="pre" id="request-meta"></pre>
+          <pre class="pre" id="request-json"></pre>
+          <p class="hint">Long base64 values are shortened in this view. Copy JSON contains the full body. The browser adds its own standard headers (User-Agent and similar).</p>
+        </div>
+
+        <div class="pane" data-pane="response" hidden>
+          <div class="pane-actions">
+            <button type="button" class="btn" id="copy-response">Copy JSON</button>
+            <button type="button" class="btn" id="download-response">Download JSON</button>
+          </div>
+          <pre class="pre" id="response-meta"></pre>
+          <pre class="pre" id="response-json">No response yet.</pre>
+        </div>
+
+        <div class="pane" data-pane="usage" hidden>
+          <dl class="kv" id="usage-detail"><dt>Status</dt><dd>No response yet.</dd></dl>
+          <pre class="pre" id="usage-json"></pre>
+        </div>
+
+        <div class="pane" data-pane="errors" hidden>
+          <div id="error-view"><p class="muted">No errors.</p></div>
+        </div>
+      </div>
     </section>
 
+    <footer class="composer">
+      <div class="composer-inner">
+        <div id="composer-note"></div>
+        <div class="composer-box">
+          <div class="chips" id="attachments"></div>
+          <textarea class="prompt" id="prompt" rows="1" placeholder="Message the model…" aria-label="Prompt" disabled></textarea>
+          <div class="composer-bar">
+            <button type="button" class="btn ghost" id="add-images" disabled>Add image</button>
+            <button type="button" class="btn ghost" id="add-docs" disabled>Add file</button>
+            <span class="muted small grow ellipsis" id="attach-status"></span>
+            <button type="button" class="btn ghost" id="delete-uploads" disabled>Delete uploads</button>
+            <button type="button" class="btn primary" id="run" disabled>Run</button>
+          </div>
+          <input type="file" id="image-input" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden>
+          <input type="file" id="doc-input" accept=".pdf,.txt,.md,.csv,.json,.html,.xml,.docx,.pptx,.xlsx" multiple hidden>
+        </div>
+        <p class="composer-hint">Enter sends · Shift+Enter adds a new line</p>
+      </div>
+    </footer>
+
   </main>
-
-
-  <script src="app.js"></script>
-
+</div>
+<script src="app.js"></script>
 </body>
 </html>
